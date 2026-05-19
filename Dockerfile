@@ -1,6 +1,5 @@
-
-# ARG BASE_IMAGE="docker.io/library/debian:bookworm-20260421-slim@sha256:5a2a80d11944804c01b8619bc967e31801ec39bf3257ab80b91070eb23625644"
-ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260410@sha256:cdb5fd928fced577cfecf12c8966e830fcdf42ee481fb0b91904eeddc2fe5eff"
+# syntax=docker.io/docker/dockerfile:1
+ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260410"
 ARG APT_UPDATE_SNAPSHOT=20260410T030400Z
 ARG CARTESI_MACHINE_EMULATOR_VERSION="0.19.0"
 ARG CARTESI_IMAGE_KERNEL_VERSION="0.20.0"
@@ -16,6 +15,7 @@ ARG ALTO_VERSION="1.2.7"
 ARG ALTO_PACKAGE_VERSION="0.0.20"
 ARG CARTESAPP_VERSION="1.2.6"
 ARG CLAUDEAI_VERSION=2.1.132
+ARG PODMAN_VERSION=5.8.2-1
 
 ################################################################################
 # base image
@@ -81,8 +81,8 @@ tar -zx -f /tmp/foundry.tar.gz -C /usr/local/bin
 EOF
 
 ################################################################################
-# cartesi rollups-runtime target
-FROM base AS rollups-runtime
+# cartesi rollups target
+FROM base AS rollups
 ARG CARTESI_MACHINE_EMULATOR_VERSION
 # ARG CARTESI_ROLLUPS_NODE_VERSION
 ARG TARGETARCH
@@ -202,8 +202,8 @@ ADD --checksum=sha256:4a4714bfa8c0028cb443db2036fad4f8da07065c1cb4ac8e0921a259fd
 RUN tar -xJf "/tmp/linux-headers-${CARTESI_LINUX_KERNEL_VERSION}.tar.xz" -C /
 
 ################################################################################
-# sdk final image
-FROM rollups-runtime AS runtime
+# install packages
+FROM rollups AS install
 ARG APT_UPDATE_SNAPSHOT
 ARG ALTO_VERSION
 ARG ALTO_PACKAGE_VERSION
@@ -211,18 +211,17 @@ ARG CARTESI_MACHINE_EMULATOR_VERSION
 ARG NODE_VERSION
 ARG NVM_VERSION
 ARG TARGETARCH
+ARG TARGETOS
 ARG XGENEXT2_VERSION
 ARG CARTESAPP_VERSION
 ARG CLAUDEAI_VERSION
+ARG PODMAN_VERSION
 
 USER root
 ARG DEBIAN_FRONTEND=noninteractive
 RUN <<EOF
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 apt-get install -y --no-install-recommends \
-    python3 \
-    python3-venv \
-    python3-pip \
     git \
     jq \
     libarchive-tools \
@@ -230,22 +229,14 @@ apt-get install -y --no-install-recommends \
     libslirp0 \
     lua5.4 \
     locales \
+    python3 \
+    python3-pip \
+    python3-venv \
+    qemu-user-static \
     vim \
     xxd \
     xz-utils
-rm -rf /var/lib/apt/lists/*
 EOF
-
-# Install nvm and node
-ENV NVM_DIR=/root/.nvm
-RUN <<EOF
-curl -o- --fail --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/nvm-sh/nvm/${NVM_VERSION}/install.sh | bash
-. "$NVM_DIR/nvm.sh"
-nvm install $NODE_VERSION
-nvm use $NODE_VERSION
-nvm alias default $NODE_VERSION
-EOF
-ENV PATH="${NVM_DIR}/versions/node/v${NODE_VERSION}/bin:$PATH"
 
 # Install dpkg release of xgenext2fs
 RUN <<EOF
@@ -259,23 +250,10 @@ locale-gen
 update-locale LANG=en_US.UTF-8
 EOF
 
-# Install nodejs packages
-COPY --from=alto /app/alto/src/pimlico-alto-${ALTO_PACKAGE_VERSION}.tgz /tmp/pimlico-alto.tgz
-RUN <<EOF
-npm install -g \
-    /tmp/pimlico-alto.tgz
-
-rm /tmp/pimlico-alto.tgz
-EOF
-
 ENV LC_ALL=en_US.UTF-8
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 
-# healthcheck script using net_listening JSON-RPC method
-# COPY alto /usr/local/bin
-# COPY devnet /usr/local/bin
-# COPY eth_isready /usr/local/bin
 
 # COPY entrypoint.sh /usr/local/bin/
 COPY --from=foundry /usr/local/bin/anvil /usr/local/bin/
@@ -292,69 +270,65 @@ mkdir -p /projects
 chown ubuntu:ubuntu /projects
 EOF
 
-
-RUN <<EOFOUT
+RUN <<EOF
 set -e
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
-tee /etc/apt/sources.list.d/docker.sources <<EOF
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
+apt-get install -y --no-install-recommends \
+    gnupg \
+    uidmap \
+    netavark
+. /etc/os-release
+echo "deb http://download.opensuse.org/repositories/home:/alvistack/xUbuntu_${VERSION_ID}/ /" \
+    | tee /etc/apt/sources.list.d/home:alvistack.list
+curl -fsSL https://download.opensuse.org/repositories/home:alvistack/xUbuntu_${VERSION_ID}/Release.key \
+    | gpg --dearmor | tee /etc/apt/trusted.gpg.d/home_alvistack.gpg > /dev/null
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 apt-get install -y --no-install-recommends \
-    docker-ce \
-    docker-ce-cli \
-    containerd.io \
-    docker-buildx-plugin \
-    docker-compose-plugin \
-    kmod \
-    uidmap \
-    libcap2-bin
-# rm -rf /var/lib/apt/lists/*
-EOFOUT
-
-# RUN set -eux; \
-# 	echo 'ubuntu:100000:65536' >> /etc/subuid; \
-# 	echo 'ubuntu:100000:65536' >> /etc/subgid
-
-# COPY --chmod=755 <<EOF /usr/local/sbin/docker
-# #!/bin/sh
-# if ! (pgrep dockerd >/dev/null 2>&1); then
-#     dockerd > ~/.dockerd.log 2>&1 &
-# fi
-# exec /usr/sbin/docker "\$@"
-# EOF
-
+    podman
+ln -s /usr/bin/podman /usr/bin/docker
+apt-get remove --purge -y \
+    gnupg
+rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/home:alvistack.list /etc/apt/trusted.gpg.d/home_alvistack.gpg
+apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
+EOF
 
 RUN <<EOF
 set -e
-chmod 0755 /usr/bin/newuidmap /usr/bin/newgidmap
-setcap cap_setuid+ep /usr/bin/newuidmap
-setcap cap_setgid+ep /usr/bin/newgidmap
-chmod -s /usr/bin/newuidmap
-chmod -s /usr/bin/newgidmap
+echo 'ubuntu:100000:65535' > /etc/subuid
+echo 'ubuntu:100000:65535' > /etc/subgid
 EOF
 
-FROM runtime AS user-runtime
+################################################################################
+# user install packages
+FROM install AS user-install
 USER ubuntu
 
-RUN <<EOF
-set -e
-curl -fsSL https://get.docker.com/rootless > /tmp/rootless.sh
-chmod +x /tmp/rootless.sh
-/tmp/rootless.sh --force
-rm /tmp/rootless.sh
-
+RUN mkdir -p /home/ubuntu/.config/containers
+COPY <<EOF /home/ubuntu/.config/containers/containers.conf
+[containers]
+default_sysctls = []
+netns = "host"
+pidns = "host"
 EOF
 
-ENV PATH=/home/ubuntu/bin:$PATH
-RUN echo "export XDG_RUNTIME_DIR=/home/ubuntu/.docker/run" >> /home/ubuntu/.bashrc
-RUN echo "export DOCKER_HOST=unix:///home/ubuntu/.docker/run/docker.sock" >> /home/ubuntu/.bashrc
+COPY <<EOF /home/ubuntu/.config/containers/registries.conf
+unqualified-search-registries = ["docker.io"]
+EOF
+
+# Install nvm and node
+ENV NVM_DIR=/home/ubuntu/.nvm
+RUN <<EOF
+curl -o- --fail --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/nvm-sh/nvm/${NVM_VERSION}/install.sh | bash
+. "$NVM_DIR/nvm.sh"
+nvm install $NODE_VERSION
+nvm use $NODE_VERSION
+nvm alias default $NODE_VERSION
+EOF
+ENV PATH="${NVM_DIR}/versions/node/v${NODE_VERSION}/bin:$PATH"
+
+# Install nodejs packages
+COPY --from=alto /app/alto/src/pimlico-alto-${ALTO_PACKAGE_VERSION}.tgz /tmp/pimlico-alto.tgz
+
+RUN npm install -g /tmp/pimlico-alto.tgz
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
@@ -366,6 +340,21 @@ EOF
 
 RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDEAI_VERSION}
 
-ENV PATH="/home/ubuntu/.local/bin:$PATH"
+RUN echo <<EOF
+PATH=/opt/venv/bin:\$PATH
+PATH=/home/ubuntu/.local/bin:\$PATH
+EOF >> /home/ubuntu/.bashrc
 
+USER root
+
+# cleanup
+RUN <<EOF
+set -e
+rm -rf /tmp/* /var/lib/apt/lists/* /var/log/* /var/cache/*
+EOF
+
+FROM user-install AS runtime
+
+USER ubuntu
+WORKDIR /home/ubuntu
 
