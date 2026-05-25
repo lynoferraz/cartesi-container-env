@@ -1,141 +1,136 @@
-# Cartesi Container Environemt
+# Cartesi Container Environment
 
-Container with cartesi tools to isolate development of Applications with AI tools. This approach creates a global 
+A rootless OCI sandbox preloaded with Cartesi tooling (cartesi-machine, cartesi-cli, foundry,
+alto, podman, node, claude-code, …) for isolated development of Cartesi applications and AI
+agents.
 
-## Requirements
-
-- [docker](https://docs.docker.com/) to build the rootfs image.
-
-Optionally
-
-- [crun](https://github.com/containers/crun) to execute the container (Possible with `runc`).
-
-## Global Setup
-
-Copy the repo files `Dockerfile` and `sandbox-config.json` to a chosen destination where it will contain the rootfs for the container. We'll assume you you'll install in ~/sandbox
+## Quick install
 
 ```shell
-mkdir ~/sandbox
-cd ~/sandbox
+curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/install.sh | sh
+```
+
+This drops `cartesi-sandbox` into `~/.local/bin/`, downloads a CI-built rootfs tarball for
+your architecture from GitHub Releases, verifies it against `SHA256SUMS`, and installs it
+under `~/.local/share/cartesi-sandbox/`. The installer aborts early if host prerequisites
+are missing — it prints the exact `apt-get` / `usermod` commands to fix them. Use `--no-install` to skip the rootfs instalation, and `--branch` to specify the script branch or tag.
+
+To build the rootfs locally instead (slow, needs docker):
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/install.sh \
+    | sh -s -- --from-source
+```
+
+TO use a specific release of the rootfs:
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/install.sh \
+    | sh -s -- --tag v0.1.0
+```
+## Usage
+
+In any project directory:
+
+```shell
+cd path/to/project
+cartesi-sandbox init      # writes ./sandbox-config.json with this project's path baked in
+cartesi-sandbox run       # exec into the sandbox (uses crun if available, else runc)
+```
+
+The current directory is bind-mounted at `/projects/<basename>` inside the sandbox, and
+becomes the container's working directory. `./sandbox-config.json` itself is masked over
+`/dev/null` inside the container so the sandboxed code can't tamper with its own runtime
+config. The `.secrets/` directory in the project is also masked — use it for test secrets
+you do NOT want exposed to the agent.
+
+when you run the sand box for the first time, install you favorite AI tool, and it will be available on every sandboxes
+
+
+### Other subcommands
+
+| Command                          | What it does                                    |
+|----------------------------------|-------------------------------------------------|
+| `cartesi-sandbox doctor`         | Check host prereqs and print fixes               |
+| `cartesi-sandbox update`         | Re-download / rebuild the rootfs                 |
+| `cartesi-sandbox uninstall`      | Remove the installation                          |
+| `cartesi-sandbox version`        | Print version                                    |
+
+## Host prerequisites
+
+`cartesi-sandbox doctor` checks all of these. None are installed automatically — run the
+suggested commands yourself:
+
+- **OCI runtime**: `crun` (preferred) or `runc` — `sudo apt-get install -y crun`
+- **uidmap tools**: `newuidmap` / `newgidmap` — `sudo apt-get install -y uidmap`
+- **subuid/subgid entries** for your user — `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`
+- **zstd** (for extracting the release tarball) — `sudo apt-get install -y zstd`
+
+For rootless **podman inside the sandbox**, also:
+
+```shell
+sudo sysctl -w kernel.unprivileged_userns_clone=1
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+(Persist in `/etc/sysctl.d/`.)
+
+## Manual install (without the installer)
+
+If you don't want to pipe a script from the internet, the manual flow still works.
+
+```shell
+mkdir ~/sandbox && cd ~/sandbox
 wget https://github.com/lynoferraz/cartesi-container-env/raw/refs/heads/main/Dockerfile
 wget https://github.com/lynoferraz/cartesi-container-env/raw/refs/heads/main/sandbox-config.json
-```
 
-Build the image and generate the tar of the file system.
-
-```shell
 docker buildx build -f Dockerfile --output type=tar,dest=docker-sandbox.tar .
-```
 
-Extract the tar and finalize configurations
-
-```shell
 mkdir -p docker-sandbox/rootfs
 tar xf docker-sandbox.tar -C docker-sandbox/rootfs
-cp /etc/resolv.conf docker-sandbox/rootfs/etc/resolv.conf
+sudo cp /etc/resolv.conf docker-sandbox/rootfs/etc/resolv.conf
 sudo chown -R 100000:100000 docker-sandbox/rootfs/
-sudo chown -R 1000:1000 docker-sandbox/rootfs/home/ubuntu/
-sudo chmod 777 docker-sandbox/rootfs/tmp
-sudo chmod 777 docker-sandbox/rootfs/var/tmp/
-```
-
-Also, do some final adjustments on the filesystem to enable rootless podman:
-
-```shell
+sudo chown -R 1000:1000     docker-sandbox/rootfs/home/ubuntu/
+sudo chmod 777 docker-sandbox/rootfs/tmp docker-sandbox/rootfs/var/tmp/
 sudo setcap cap_setuid+ep docker-sandbox/rootfs/usr/bin/newuidmap
 sudo setcap cap_setgid+ep docker-sandbox/rootfs/usr/bin/newgidmap
 ```
 
-## Project Setup
-
-To initiate the project with container, in the project directory:
+Per project:
 
 ```shell
 cd path/to/project
-```
-
-Copy the template `sandbox-config.json` and customize
-
-```shell
 cp ~/sandbox/sandbox-config.json .
 sed -i "s#{{project_path}}#$(pwd)#g" sandbox-config.json
 sed -i "s#{{project}}#$(basename $(pwd))#g" sandbox-config.json
-```
 
-## Run Project Container (with `crun`)
-
-```shell
 crun run --config sandbox-config.json --bundle ~/sandbox/docker-sandbox/ $(basename $(pwd))
 ```
 
-### Run with `runc`
-
-With `runc` the config.json should be int the bundle directory. So instead of conpying only the file to the project dir, you should create a bundle dir with the configuration:
+For `runc`, the config has to live in the bundle dir:
 
 ```shell
 mkdir ~/sandbox/myproject
-ln -sr ~/sandbox/docker-sandbox/rootfs ~/sandbox/docker-sandbox/rootfs
-cp ~/sandbox/sandbox-config.json mkdir ~/sandbox/myproject/.
-sed -i "s#{{project_path}}#$(pwd)#g" ~/sandbox/myproject/sandbox-config.json
-sed -i "s#{{project}}#$(basename $(pwd))#g" ~/sandbox/myproject/sandbox-config.json
+ln -sr ~/sandbox/docker-sandbox/rootfs ~/sandbox/myproject/rootfs
+cp ~/sandbox/sandbox-config.json ~/sandbox/myproject/config.json
+sed -i "s#{{project_path}}#$(pwd)#g"             ~/sandbox/myproject/config.json
+sed -i "s#{{project}}#$(basename $(pwd))#g"      ~/sandbox/myproject/config.json
+runc run --bundle ~/sandbox/myproject/ $(basename $(pwd))
 ```
 
-And the you can run with:
+## Troubleshooting
+
+**`[rootlesskit:parent] error: failed to start the child: fork/exec /proc/self/exe: operation not permitted`**
 
 ```shell
-runc run --config sandbox-config.json --bundle ~/sandbox/myproject/ $(basename $(pwd))
-```
-
-### Secrets
-
-The container makes the `sandbox-config.json` inaccessible, so it won't be able to change the configuration of the own container. Also it  the directory `.secrets`, so you can use this directory to add any secrets to test the application.
-
-### Rootless Docker inside the Container
-
-The Dockerfile install the docker tools including the rootless docker. Since you can't run docker as a service you have to run it with:
-
-```shell
-dockerd-rootless.sh > ~/.docker/docker.log 2>&1 &
-```
-
-#### Troubleshooting
-
-**failed to start the child**
-
-If you have errors like these when trying to start docker roUbuntu namespace permission error
-
-```
-
-[rootlesskit:parent] error: failed to start the child: fork/exec /proc/self/exe: operation not permitted
-```
-
-Set this allow the container to create the namespaces:
-
-```shell
-sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 sudo sysctl -w kernel.unprivileged_userns_clone=1
 ```
 
-Ypu can add these configurations to `/etc/sysctl.conf` to make it permanent.
+**`write to uid_map: Operation not permitted`** — install `uidmap` and check `/etc/subuid` / `/etc/subgid` as above.
 
-**write to `uid_map`: Operation not permitted**
-
-If you get this error while trying to run `crun`/`runc`, make sure you have `newuidmap`/`newgidmap` installed (`uidmap` package). 
-
-If you get the following error:
-
-```
-newuidmap: uid range X -> X not allowed
-```
-
-ensure that your user have entries in `/etc/subuid` and `/etc/subgid`. You can add with: 
+**`newuidmap: uid range X -> X not allowed`** — add the subuid range:
 
 ```shell
-sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <your_username>
-```
-
-**failed to setup UID/GID map**
-
-```
-[rootlesskit:parent] error: failed to setup UID/GID map: newuidmap XXX [0 1000 1 1 100000 165536] failed: newuidmap: write to uid_map failed: Operation not permitted
+sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER
 ```

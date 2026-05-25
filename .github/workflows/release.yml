@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-rootfs:
+    name: Build rootfs (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Build rootfs tar
+        run: |
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            -f Dockerfile \
+            --output type=tar,dest=rootfs.tar \
+            .
+
+      - name: Compress
+        run: zstd -T0 -19 rootfs.tar -o rootfs-${{ matrix.arch }}.tar.zst
+
+      - name: Per-arch sha256
+        run: sha256sum rootfs-${{ matrix.arch }}.tar.zst > rootfs-${{ matrix.arch }}.tar.zst.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.arch }}
+          path: |
+            rootfs-${{ matrix.arch }}.tar.zst
+            rootfs-${{ matrix.arch }}.tar.zst.sha256
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build-rootfs
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm ./*.sha256
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rootfs-amd64.tar.zst
+            dist/rootfs-arm64.tar.zst
+            dist/SHA256SUMS
+            cartesi-sandbox
+            install.sh
+          generate_release_notes: true

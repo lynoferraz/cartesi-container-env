@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# cartesi-sandbox — OCI sandbox runner for Cartesi development
+set -euo pipefail
+
+echo ok
+
+SCRIPT_VERSION=0.0.0
+# SCRIPT_VERSION={{SCRIPT_TAG}}
+REPO="${CARTESI_SANDBOX_REPO:-lynoferraz/cartesi-container-env}"
+BRANCH="${CARTESI_SANDBOX_BRANCH:-main}"
+RELEASE_TAG_DEFAULT="${CARTESI_SANDBOX_RELEASE_TAG:-latest}"
+INSTALL_DIR="${CARTESI_SANDBOX_HOME:-$HOME/.local/share/cartesi-sandbox}"
+BUNDLE_DIR="$INSTALL_DIR/bundle"
+ROOTFS_DIR="$BUNDLE_DIR/rootfs"
+TEMPLATE_CONFIG="$INSTALL_DIR/sandbox-config.json"
+
+if [ -t 1 ]; then
+    C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+else
+    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+log()  { printf "%s[*]%s %s\n" "$C_BLUE"   "$C_RESET" "$*"; }
+ok()   { printf "%s[+]%s %s\n" "$C_GREEN"  "$C_RESET" "$*"; }
+warn() { printf "%s[!]%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()  { printf "%s[x]%s %s\n" "$C_RED"    "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+require_linux() {
+    [ "$(uname -s)" = "Linux" ] || die "cartesi-sandbox requires Linux."
+}
+
+
+resolve_release_tag() {
+    local tag="$1"
+    if [ "$tag" = "latest" ]; then
+        curl -fsSL "https://api.github.com/repos/${REPO}/tags" \
+            | grep '"name":' \
+            | sed -E 's/.*"([^"]+)".*/\1/'  \
+            | head -n1
+    else
+        echo "$tag"
+    fi
+}
+
+# ---------------------------------------------------------------- doctor
+
+cmd_doctor() {
+    local hard_fail=0
+
+    if command -v crun >/dev/null 2>&1; then
+        ok "OCI runtime: crun ($(crun --version | head -n1))"
+    elif command -v runc >/dev/null 2>&1; then
+        ok "OCI runtime: runc ($(runc --version | head -n1))"
+    else
+        err "No OCI runtime found."
+        echo "    Fix:  sudo apt-get install -y crun        # or: runc"
+        hard_fail=1
+    fi
+
+    if command -v newuidmap >/dev/null 2>&1 && command -v newgidmap >/dev/null 2>&1; then
+        ok "newuidmap/newgidmap present"
+    else
+        err "newuidmap/newgidmap not found."
+        echo "    Fix:  sudo apt-get install -y uidmap"
+        hard_fail=1
+    fi
+
+    local me="${USER:-$(id -un)}"
+    if grep -q "^${me}:" /etc/subuid 2>/dev/null \
+        && grep -q "^${me}:" /etc/subgid 2>/dev/null; then
+        ok "subuid/subgid entries for $me"
+    else
+        err "Missing subuid/subgid entries for $me."
+        echo "    Fix:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $me"
+        hard_fail=1
+    fi
+
+    local u a
+    u=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)
+    a=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)
+    if [ -n "$u" ] && [ "$u" != "1" ]; then
+        warn "kernel.unprivileged_userns_clone=$u (rootless podman inside the sandbox will fail)"
+        echo "    Fix:  sudo sysctl -w kernel.unprivileged_userns_clone=1"
+    fi
+    if [ -n "$a" ] && [ "$a" != "0" ]; then
+        warn "kernel.apparmor_restrict_unprivileged_userns=$a (rootless podman inside the sandbox will fail)"
+        echo "    Fix:  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+    fi
+
+    if [ -d "$ROOTFS_DIR" ]; then
+        ok "rootfs installed at $ROOTFS_DIR"
+    else
+        warn "rootfs not installed."
+        echo "    Fix:  cartesi-sandbox install"
+    fi
+
+    return $hard_fail
+}
+
+# ---------------------------------------------------------------- install
+
+cmd_install() {
+    local from_source=0
+    local tag="$RELEASE_TAG_DEFAULT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from-source) from_source=1; shift ;;
+            --tag) tag="${2:-}"; shift 2 ;;
+            --tag=*) tag="${1#--tag=}"; shift ;;
+            -h|--help)
+                cat <<EOF
+Usage: cartesi-sandbox install [--from-source] [--tag <tag>]
+EOF
+                return 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    require_linux
+    [ "$(id -u)" != "0" ] || die "Do not run as root."
+
+    log "Checking host prerequisites..."
+    if ! cmd_doctor; then
+        die "Prerequisites missing. See messages above."
+    fi
+
+    mkdir -p "$BUNDLE_DIR"
+    local arch
+    arch=$(detect_arch)
+
+    if [ "$from_source" -eq 1 ]; then
+        install_from_source
+    else
+        install_from_release "$arch" "$tag"
+    fi
+
+    apply_rootfs_permissions
+    install_template_config
+    ok "Installation complete."
+    log "Next:  cd path/to/project && cartesi-sandbox init && cartesi-sandbox run"
+}
+
+install_from_release() {
+    local arch="$1" requested_tag="$2"
+    local tag
+    tag=$(resolve_release_tag "$requested_tag")
+    [ -n "$tag" ] || die "Could not resolve release tag '$requested_tag'."
+    log "Downloading rootfs ($tag, $arch) from GitHub Releases..."
+
+    local base="https://github.com/${REPO}/releases/download/${tag}"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    curl -fSL --progress-bar -o "$tmpdir/rootfs.tar.zst" "$base/rootfs-${arch}.tar.zst"
+    curl -fsSL              -o "$tmpdir/SHA256SUMS"     "$base/SHA256SUMS"
+
+    log "Verifying checksum..."
+    (cd "$tmpdir" && grep " rootfs-${arch}.tar.zst$" SHA256SUMS | sha256sum -c -) \
+        || die "Checksum verification failed."
+
+    extract_rootfs_zst "$tmpdir/rootfs.tar.zst"
+}
+
+install_from_source() {
+    command -v docker >/dev/null 2>&1 || die "--from-source requires docker."
+    log "Building rootfs from source via docker buildx (this may take several minutes)..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/Dockerfile" \
+        -o "$tmpdir/Dockerfile"
+    ( cd "$tmpdir" \
+        && docker buildx build -f Dockerfile --output "type=tar,dest=rootfs.tar" . )
+    log "Extracting rootfs into $ROOTFS_DIR (requires sudo)..."
+    sudo rm -rf "$ROOTFS_DIR"
+    sudo mkdir -p "$ROOTFS_DIR"
+    sudo tar -xf "$tmpdir/rootfs.tar" -C "$ROOTFS_DIR"
+}
+
+extract_rootfs_zst() {
+    local archive="$1"
+    log "Extracting rootfs into $ROOTFS_DIR (requires sudo)..."
+    sudo rm -rf "$ROOTFS_DIR"
+    sudo mkdir -p "$ROOTFS_DIR"
+    if command -v zstd >/dev/null 2>&1; then
+        zstd -dc "$archive" | sudo tar -x -C "$ROOTFS_DIR"
+    elif tar --help 2>&1 | grep -q -- --zstd; then
+        sudo tar --zstd -xf "$archive" -C "$ROOTFS_DIR"
+    else
+        die "Need zstd (or a tar that supports --zstd) to extract the rootfs. Install:  sudo apt-get install -y zstd"
+    fi
+}
+
+apply_rootfs_permissions() {
+    log "Applying rootfs ownership and capabilities (sudo)..."
+    sudo cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+    sudo chown -R 100000:100000 "$ROOTFS_DIR/"
+    sudo chown -R 1000:1000     "$ROOTFS_DIR/home/ubuntu/"
+    sudo chmod 777 "$ROOTFS_DIR/tmp"
+    sudo chmod 777 "$ROOTFS_DIR/var/tmp/"
+    sudo setcap cap_setuid+ep "$ROOTFS_DIR/usr/bin/newuidmap"
+    sudo setcap cap_setgid+ep "$ROOTFS_DIR/usr/bin/newgidmap"
+}
+
+install_template_config() {
+    log "Fetching sandbox-config.json template..."
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/sandbox-config.json" \
+        -o "$TEMPLATE_CONFIG"
+}
+
+# ---------------------------------------------------------------- init / run
+
+cmd_init() {
+    local project_dir="${1:-$PWD}"
+    project_dir=$(cd "$project_dir" && pwd)
+    [ -f "$TEMPLATE_CONFIG" ] \
+        || die "Template config not found at $TEMPLATE_CONFIG. Run: cartesi-sandbox install"
+    local out="$project_dir/sandbox-config.json"
+    cp "$TEMPLATE_CONFIG" "$out"
+    sed -i "s#{{project_path}}#${project_dir}#g" "$out"
+    sed -i "s#{{project}}#$(basename "$project_dir")#g" "$out"
+    ok "Wrote $out"
+}
+
+cmd_run() {
+    local project_dir="${1:-$PWD}"
+    project_dir=$(cd "$project_dir" && pwd)
+    local project_name
+    project_name=$(basename "$project_dir")
+    local config="$project_dir/sandbox-config.json"
+    [ -f "$config" ]      || die "$config not found. Run: cartesi-sandbox init"
+    [ -d "$ROOTFS_DIR" ]  || die "Rootfs not installed. Run: cartesi-sandbox install"
+
+    if command -v crun >/dev/null 2>&1; then
+        exec crun run --config "$config" --bundle "$BUNDLE_DIR" "$project_name"
+    elif command -v runc >/dev/null 2>&1; then
+        local stage="$INSTALL_DIR/projects/$project_name"
+        mkdir -p "$stage"
+        ln -sfn "$ROOTFS_DIR" "$stage/rootfs"
+        cp "$config" "$stage/config.json"
+        exec runc run --bundle "$stage" "$project_name"
+    else
+        die "Neither crun nor runc available. Run: cartesi-sandbox doctor"
+    fi
+}
+
+# ---------------------------------------------------------------- misc
+
+cmd_update()    { cmd_install "$@"; }
+cmd_uninstall() {
+    log "Removing $INSTALL_DIR (sudo needed for rootfs)..."
+    sudo rm -rf "$INSTALL_DIR"
+    rm -f "$HOME/.local/bin/cartesi-sandbox"
+    ok "Uninstalled."
+}
+cmd_version()   { echo "cartesi-sandbox $SCRIPT_VERSION"; }
+
+usage() {
+    cat <<EOF
+cartesi-sandbox $SCRIPT_VERSION — OCI sandbox for Cartesi development
+
+Usage:
+  cartesi-sandbox install [--from-source] [--tag <tag>]
+                                       set up the rootfs (one-time)
+  cartesi-sandbox init    [path]       stage sandbox-config.json in a project
+  cartesi-sandbox run     [path]       run the sandbox for a project
+  cartesi-sandbox doctor               check host prerequisites
+  cartesi-sandbox update               re-download / rebuild the rootfs
+  cartesi-sandbox uninstall            remove the installation
+  cartesi-sandbox version              print version
+
+Environment:
+  CARTESI_SANDBOX_HOME        install root  (default: ~/.local/share/cartesi-sandbox)
+  CARTESI_SANDBOX_REPO        repo slug     (default: $REPO)
+  CARTESI_SANDBOX_BRANCH      template branch (default: $BRANCH)
+  CARTESI_SANDBOX_RELEASE_TAG release tag   (default: latest)
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"; shift || true
+    case "$cmd" in
+        install)              cmd_install   "$@" ;;
+        init)                 cmd_init      "$@" ;;
+        run)                  cmd_run       "$@" ;;
+        doctor)               cmd_doctor    "$@" ;;
+        update)               cmd_update    "$@" ;;
+        uninstall)            cmd_uninstall "$@" ;;
+        version|-v|--version) cmd_version ;;
+        debug-function) 
+            cmdfn=$1
+            shift || true
+            $cmdfn "$@"
+        ;;
+        help|-h|--help|"")    usage ;;
+        *) err "Unknown command: $cmd"; usage; exit 2 ;;
+    esac
+}
+
+main "$@"

@@ -14,7 +14,6 @@ ARG NODE_VERSION="24.14.0"
 ARG ALTO_VERSION="1.2.7"
 ARG ALTO_PACKAGE_VERSION="0.0.20"
 ARG CARTESAPP_VERSION="1.2.6"
-ARG CLAUDEAI_VERSION=2.1.132
 ARG PODMAN_VERSION=5.8.2-1
 
 ################################################################################
@@ -214,7 +213,6 @@ ARG TARGETARCH
 ARG TARGETOS
 ARG XGENEXT2_VERSION
 ARG CARTESAPP_VERSION
-ARG CLAUDEAI_VERSION
 ARG PODMAN_VERSION
 
 USER root
@@ -283,12 +281,30 @@ curl -fsSL https://download.opensuse.org/repositories/home:alvistack/xUbuntu_${V
     | gpg --dearmor | tee /etc/apt/trusted.gpg.d/home_alvistack.gpg > /dev/null
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 apt-get install -y --no-install-recommends \
-    podman
-ln -s /usr/bin/podman /usr/bin/docker
+    podman\
+    podman-compose
 apt-get remove --purge -y \
     gnupg
 rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/home:alvistack.list /etc/apt/trusted.gpg.d/home_alvistack.gpg
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
+EOF
+
+COPY --chmod=755 <<EOF /usr/bin/docker
+#!/bin/sh
+set -eu
+
+filtered=""
+last_arg=""
+for arg in "\$@"; do
+    if [ "\$last_arg" = "--progress" ] && [ "\$arg" = "quiet" ]; then
+        filtered="$filtered --quiet"
+    fi
+    [ "\$arg" = "--progress" ] || [ "\$last_arg" = "--progress" ] || filtered="\$filtered \$arg"
+    last_arg="\$arg"
+done
+
+# shellcheck disable=SC2086
+exec podman \$filtered
 EOF
 
 RUN <<EOF
@@ -338,11 +354,9 @@ RUN <<EOF
 pip3 install --no-cache cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v${CARTESAPP_VERSION}
 EOF
 
-RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDEAI_VERSION}
-
 RUN echo <<EOF
-PATH=/opt/venv/bin:\$PATH
-PATH=/home/ubuntu/.local/bin:\$PATH
+export PATH=/opt/venv/bin:\$PATH
+export PATH=/home/ubuntu/.local/bin:\$PATH
 EOF >> /home/ubuntu/.bashrc
 
 USER root
