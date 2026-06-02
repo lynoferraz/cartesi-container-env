@@ -2,8 +2,6 @@
 # cartesi-sandbox — OCI sandbox runner for Cartesi development
 set -euo pipefail
 
-echo ok
-
 SCRIPT_VERSION=0.0.0
 # SCRIPT_VERSION={{SCRIPT_TAG}}
 REPO="${CARTESI_SANDBOX_REPO:-lynoferraz/cartesi-container-env}"
@@ -208,10 +206,12 @@ apply_rootfs_permissions() {
     sudo cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
     sudo chown -R 100000:100000 "$ROOTFS_DIR/"
     sudo chown -R 1000:1000     "$ROOTFS_DIR/home/ubuntu/"
+    sudo chown -R 1000:1000     "$ROOTFS_DIR/opt/venv"
     sudo chmod 777 "$ROOTFS_DIR/tmp"
     sudo chmod 777 "$ROOTFS_DIR/var/tmp/"
     sudo setcap cap_setuid+ep "$ROOTFS_DIR/usr/bin/newuidmap"
     sudo setcap cap_setgid+ep "$ROOTFS_DIR/usr/bin/newgidmap"
+    sudo chmod -s "$ROOTFS_DIR/usr/bin/newuidmap" "$ROOTFS_DIR/usr/bin/newgidmap"
 }
 
 install_template_config() {
@@ -234,15 +234,77 @@ cmd_init() {
     ok "Wrote $out"
 }
 
+# Returns 0 (true) if a container/session with the given name is already running.
+_session_is_running() {
+    local name="$1"
+    local state=""
+    if command -v crun >/dev/null 2>&1; then
+        state=$(crun state "$name" 2>/dev/null \
+            | grep '"status"' \
+            | sed -E 's/.*"status": *"([^"]+)".*/\1/' || true)
+    elif command -v runc >/dev/null 2>&1; then
+        state=$(runc state "$name" 2>/dev/null \
+            | grep '"status"' \
+            | sed -E 's/.*"status": *"([^"]+)".*/\1/' || true)
+    fi
+    [ "$state" = "running" ] || [ "$state" = "created" ]
+}
+
 cmd_run() {
-    local project_dir="${1:-$PWD}"
-    project_dir=$(cd "$project_dir" && pwd)
-    local project_name
-    project_name=$(basename "$project_dir")
-    local config="$project_dir/sandbox-config.json"
+    local project_dir=""
+    local custom_config=""
+    local session_name=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -c|--config)
+                custom_config="${2:-}"; [ -n "$custom_config" ] || die "--config requires an argument"
+                shift 2 ;;
+            --config=*)
+                custom_config="${1#--config=}"; shift ;;
+            -s|--session)
+                session_name="${2:-}"; [ -n "$session_name" ] || die "--session requires an argument"
+                shift 2 ;;
+            --session=*)
+                session_name="${1#--session=}"; shift ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: cartesi-sandbox run [path] [options]
+
+  path                      Project directory (default: current directory)
+
+Options:
+  -c, --config <file>       Use a custom sandbox-config.json
+                            (default: <path>/sandbox-config.json)
+  -s, --session <name>      Use a custom container/session name
+                            (default: project directory name)
+  -h, --help                Show this help
+EOF
+                return 0 ;;
+            -*)
+                die "Unknown option: $1" ;;
+            *)
+                if [ -z "$project_dir" ]; then
+                    project_dir="$1"
+                else
+                    die "Unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+
+    project_dir=$(cd "${project_dir:-$PWD}" && pwd)
+    local project_name="${session_name:-$(basename "$project_dir")}"
+    local config="${custom_config:-$project_dir/sandbox-config.json}"
+
     [ -f "$config" ]      || die "$config not found. Run: cartesi-sandbox init"
     [ -d "$ROOTFS_DIR" ]  || die "Rootfs not installed. Run: cartesi-sandbox install"
 
+    if _session_is_running "$project_name"; then
+        die "Session '$project_name' is already running. Stop it first or use --session to pick a different name."
+    fi
+
+    log "Starting session '$project_name'..."
     if command -v crun >/dev/null 2>&1; then
         exec crun run --config "$config" --bundle "$BUNDLE_DIR" "$project_name"
     elif command -v runc >/dev/null 2>&1; then
@@ -275,11 +337,16 @@ Usage:
   cartesi-sandbox install [--from-source] [--tag <tag>]
                                        set up the rootfs (one-time)
   cartesi-sandbox init    [path]       stage sandbox-config.json in a project
-  cartesi-sandbox run     [path]       run the sandbox for a project
+  cartesi-sandbox run     [path] [-c <config>] [-s <session>]
+                                       run the sandbox for a project
   cartesi-sandbox doctor               check host prerequisites
   cartesi-sandbox update               re-download / rebuild the rootfs
   cartesi-sandbox uninstall            remove the installation
   cartesi-sandbox version              print version
+
+Run options:
+  -c, --config <file>     custom sandbox-config.json path
+  -s, --session <name>    custom container/session name (avoids name collisions)
 
 Environment:
   CARTESI_SANDBOX_HOME        install root  (default: ~/.local/share/cartesi-sandbox)
@@ -299,12 +366,6 @@ main() {
         update)               cmd_update    "$@" ;;
         uninstall)            cmd_uninstall "$@" ;;
         version|-v|--version) cmd_version ;;
-        debug-function) 
-            cmdfn=$1
-            shift || true
-            $cmdfn "$@"
-        ;;
-        help|-h|--help|"")    usage ;;
         *) err "Unknown command: $cmd"; usage; exit 2 ;;
     esac
 }

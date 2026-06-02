@@ -282,7 +282,8 @@ curl -fsSL https://download.opensuse.org/repositories/home:alvistack/xUbuntu_${V
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 apt-get install -y --no-install-recommends \
     podman\
-    podman-compose
+    podman-compose \
+    passt
 apt-get remove --purge -y \
     gnupg
 rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/home:alvistack.list /etc/apt/trusted.gpg.d/home_alvistack.gpg
@@ -295,12 +296,27 @@ set -eu
 
 filtered=""
 last_arg=""
+arg_orig=""
 for arg in "\$@"; do
+    arg_orig="\$arg"
     if [ "\$last_arg" = "--progress" ] && [ "\$arg" = "quiet" ]; then
-        filtered="$filtered --quiet"
+        filtered="\$filtered --quiet"
     fi
-    [ "\$arg" = "--progress" ] || [ "\$last_arg" = "--progress" ] || filtered="\$filtered \$arg"
-    last_arg="\$arg"
+    if [ "\$1" =  "compose" ]; then
+        if [ "\$last_arg" = "-f" ] && [ "\$arg" = "-" ]; then
+            tmpfile=\$(mktemp)
+            cat > "\$tmpfile"
+            trap "rm -f \$tmpfile" EXIT
+            arg=\$tmpfile
+        fi
+        if [ "\$arg" = "--project-directory" ] || [ "\$last_arg" = "--project-directory" ] || [ "\$arg" = "--format" ] || [ "\$last_arg" = "--format" ]; then
+           arg=""
+        fi
+        filtered="\$filtered \$arg"
+    else
+        [ "\$arg" = "--progress" ] || [ "\$last_arg" = "--progress" ] || filtered="\$filtered \$arg"
+    fi
+    last_arg="\$arg_orig"
 done
 
 # shellcheck disable=SC2086
@@ -355,8 +371,12 @@ pip3 install --no-cache cartesapp[dev]@git+https://github.com/prototyp3-dev/cart
 EOF
 
 RUN echo <<EOF
-export PATH=/opt/venv/bin:\$PATH
-export PATH=/home/ubuntu/.local/bin:\$PATH
+export NVM_DIR="\$([ -z "\${XDG_CONFIG_HOME-}" ] && printf %s "\${HOME}/.nvm" || printf %s "\${XDG_CONFIG_HOME}/nvm")"
+[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh" # This loads nvm
+
+export PODMAN_COMPOSE_WARNING_LOGS=false
+
+export PATH=/home/ubuntu/.local/bin:/opt/venv/bin:\$PATH
 EOF >> /home/ubuntu/.bashrc
 
 USER root
