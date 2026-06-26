@@ -27,6 +27,7 @@ apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    libgomp1 \
     xz-utils
 EOF
 
@@ -41,7 +42,6 @@ apt-get install -y --no-install-recommends \
     automake \
     build-essential \
     libarchive-dev \
-    libgomp1 \
     libtool \
     liblz4-dev \
     liblzma-dev \
