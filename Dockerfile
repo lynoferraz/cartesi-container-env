@@ -41,6 +41,7 @@ apt-get install -y --no-install-recommends \
     automake \
     build-essential \
     libarchive-dev \
+    libgomp1 \
     libtool \
     liblz4-dev \
     liblzma-dev \
