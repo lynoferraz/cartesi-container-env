@@ -1,19 +1,19 @@
 # syntax=docker.io/docker/dockerfile:1
 ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260410"
 ARG APT_UPDATE_SNAPSHOT=20260410T030400Z
-ARG CARTESI_MACHINE_EMULATOR_VERSION="0.19.0"
+ARG CARTESI_MACHINE_EMULATOR_VERSION="0.20.0"
 ARG CARTESI_IMAGE_KERNEL_VERSION="0.20.0"
 ARG CARTESI_LINUX_KERNEL_VERSION="6.5.13-ctsi-1-v0.20.0"
-ARG CARTESI_ROLLUPS_NODE_VERSION="2.0.0-alpha.11"
-ARG CARTESI_CLI_VERSION="2.0.0-alpha.34"
-ARG FOUNDRY_VERSION="1.4.3"
+ARG CARTESI_ROLLUPS_NODE_VERSION="2.0.0-alpha.12"
+ARG CARTESI_CLI_VERSION="2.0.0-alpha.35"
+ARG FOUNDRY_VERSION="1.5.1"
 ARG SQUASHFS_TOOLS_VERSION="bad1d213ab6df587d6fa0ef7286180fbf7b86167" # 4.7.4
 ARG XGENEXT2_VERSION="1.5.6"
 ARG NVM_VERSION="977563e97ddc66facf3a8e31c6cff01d236f09bd" # 0.40.3
 ARG NODE_VERSION="24.14.0"
 ARG ALTO_VERSION="1.2.7"
 ARG ALTO_PACKAGE_VERSION="0.0.20"
-ARG CARTESAPP_VERSION="1.2.6"
+ARG CARTESAPP_VERSION="1.4.0"
 ARG PODMAN_VERSION=5.8.2-1
 
 ################################################################################
@@ -72,8 +72,8 @@ mkdir -p /usr/local/bin
 curl -fsSL https://github.com/foundry-rs/foundry/releases/download/v${FOUNDRY_VERSION}/foundry_v${FOUNDRY_VERSION}_${TARGETOS}_${TARGETARCH}.tar.gz \
   -o /tmp/foundry.tar.gz
 case "${TARGETARCH}" in
-    amd64) echo "325ba04dc5cb41c110723b00ac291f8269f8cd785028299aad8252ef980961a7 /tmp/foundry.tar.gz" | sha256sum --check ;;
-    arm64) echo "209492cb4ebd723d9eac002fa30f41f53c8810105b67d3c32fe8201cf70f89d4 /tmp/foundry.tar.gz" | sha256sum --check ;;
+    amd64) echo "73640b01bd9ed29fdb4965085099371f8cf0dbbec3e2086cf54564efc4dcfe88 /tmp/foundry.tar.gz" | sha256sum --check ;;
+    arm64) echo "cccf28bdf202289e837a9e21ed213b2b80dc1e806e12f1717bc98a44315c331e /tmp/foundry.tar.gz" | sha256sum --check ;;
     *) echo "unsupported architecture: ${TARGETARCH}"; exit 1 ;;
 esac
 tar -zx -f /tmp/foundry.tar.gz -C /usr/local/bin
@@ -100,8 +100,8 @@ RUN <<EOF
 curl -fsSL https://github.com/cartesi/machine-emulator/releases/download/v${CARTESI_MACHINE_EMULATOR_VERSION}/machine-emulator_${TARGETARCH}.deb \
     -o /tmp/machine-emulator.deb
 case "${TARGETARCH}" in
-    amd64) echo "adae6b030a8990e316997aad53d175192bfeaa84ad12ee19491366377073572b  /tmp/machine-emulator.deb" | sha256sum --check ;;
-    arm64) echo "15ebb64d8cd3296564d2297dd809d1d72c13a938976bb4ecc5e5c82e71bb8069  /tmp/machine-emulator.deb" | sha256sum --check ;;
+    amd64) echo "46b2f37b889091df3b89a8909467935f8dd4a1426eeb0491b6a346a12f0c341c  /tmp/machine-emulator.deb" | sha256sum --check ;;
+    arm64) echo "27ea10571335ad174b75388e7de54a3d3434bd607554d8c0bdf6abca47ceae0d  /tmp/machine-emulator.deb" | sha256sum --check ;;
     *) echo "unsupported architecture: ${TARGETARCH}"; exit 1 ;;
 esac
 apt-get install -y --no-install-recommends /tmp/machine-emulator.deb
@@ -114,8 +114,8 @@ EOF
 # curl -fsSL https://github.com/cartesi/rollups-node/releases/download/v${CARTESI_ROLLUPS_NODE_VERSION}/cartesi-rollups-node-v${CARTESI_ROLLUPS_NODE_VERSION}_${TARGETARCH}.deb \
 #     -o /tmp/cartesi-rollups-node.deb
 # case "${TARGETARCH}" in
-#     amd64) echo "72a7db2aabbf0e8d58849c9546f7c180f68c9d0550606d536d42882603550fb4 /tmp/cartesi-rollups-node.deb" | sha256sum --check ;;
-#     arm64) echo "b50b445355dda23ee06f08e7d28ed8452025e59934310c7a8115531af6eeae0c /tmp/cartesi-rollups-node.deb" | sha256sum --check ;;
+#     amd64) echo "b2db03fcab1453238346fe6638b50693a405659fd73fe3ddca5be8d4e950528a /tmp/cartesi-rollups-node.deb" | sha256sum --check ;;
+#     arm64) echo "e080a25f19f04b3d2164354c49989dcd72c02af6866623a70816eb08f0d75490 /tmp/cartesi-rollups-node.deb" | sha256sum --check ;;
 #     *) echo "unsupported architecture: ${TARGETARCH}"; exit 1 ;;
 # esac
 # apt-get install -y --no-install-recommends /tmp/cartesi-rollups-node.deb
