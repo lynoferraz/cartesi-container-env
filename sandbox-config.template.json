@@ -6,10 +6,13 @@
       "uid": 1000,
       "gid": 1000
     },
-    "args": ["bash"],
+    "args": [
+      "bash"
+    ],
     "env": [
-      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,/opt/cartesi/sbin:/opt/cartesi/bin:/home/ubuntu/.local/bin",
-      "TERM=xterm"
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/cartesi/sbin:/opt/cartesi/bin:/home/ubuntu/.local/bin",
+      "TERM=xterm",
+      "XDG_RUNTIME_DIR=/run/user/1000"
     ],
     "cwd": "/projects/{{project}}",
     "capabilities": {
@@ -19,8 +22,14 @@
         "CAP_SETUID",
         "CAP_SETGID"
       ],
-      "effective": ["CAP_KILL", "CAP_NET_BIND_SERVICE"],
-      "permitted": ["CAP_KILL", "CAP_NET_BIND_SERVICE"],
+      "effective": [
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
+      ],
+      "permitted": [
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
+      ],
       "inheritable": [],
       "ambient": []
     },
@@ -48,13 +57,24 @@
       "destination": "/dev",
       "type": "tmpfs",
       "source": "tmpfs",
-      "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+      "options": [
+        "nosuid",
+        "strictatime",
+        "mode=755",
+        "size=65536k"
+      ]
     },
     {
       "destination": "/dev/shm",
       "type": "tmpfs",
       "source": "shm",
-      "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]
+      "options": [
+        "nosuid",
+        "noexec",
+        "nodev",
+        "mode=1777",
+        "size=65536k"
+      ]
     },
     {
       "destination": "/dev/pts",
@@ -69,28 +89,74 @@
       ]
     },
     {
+      "destination": "/dev/net/tun",
+      "type": "bind",
+      "source": "/dev/net/tun",
+      "options": [
+        "bind",
+        "rw",
+        "nosuid"
+      ]
+    },
+    {
       "destination": "/sys",
       "type": "sysfs",
       "source": "sysfs",
-      "options": ["nosuid", "noexec", "nodev", "ro"]
+      "options": [
+        "nosuid",
+        "noexec",
+        "nodev",
+        "ro"
+      ]
     },
     {
       "destination": "/sys/fs/cgroup",
       "type": "cgroup",
       "source": "cgroup",
-      "options": ["nosuid", "noexec", "nodev", "relatime", "ro"]
+      "options": [
+        "nosuid",
+        "noexec",
+        "nodev",
+        "relatime",
+        "ro"
+      ]
+    },
+    {
+      "destination": "/run/user/1000",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": [
+        "nosuid",
+        "nodev",
+        "mode=700",
+        "uid=1000",
+        "gid=1000",
+        "size=512m"
+      ]
     },
     {
       "destination": "/projects/{{project}}",
       "type": "bind",
       "source": "{{project_path}}",
-      "options": ["rbind", "nosuid", "exec", "nodev", "rw"]
+      "options": [
+        "rbind",
+        "nosuid",
+        "exec",
+        "nodev",
+        "rw"
+      ]
     },
     {
       "destination": "/projects/{{project}}/sandbox-config.json",
       "type": "bind",
       "source": "/dev/null",
-      "options": ["rbind", "nosuid", "noexec", "nodev", "ro"]
+      "options": [
+        "rbind",
+        "nosuid",
+        "noexec",
+        "nodev",
+        "ro"
+      ]
     }
   ],
   "linux": {
@@ -118,57 +184,40 @@
     "uidMappings": [
       {
         "containerID": 0,
-        "hostID": 100000,
+        "hostID": "{{subuid_start}}",
         "size": 1
       },
       {
         "containerID": 1000,
-        "hostID": 1000,
+        "hostID": "{{host_uid}}",
         "size": 1
       },
       {
         "containerID": 100000,
-        "hostID": 100001,
-        "size": 65535
+        "hostID": "{{subuid_start_plus_1}}",
+        "size": "{{subuid_size_minus_1}}"
       }
     ],
     "gidMappings": [
       {
         "containerID": 0,
-        "hostID": 100000,
+        "hostID": "{{subgid_start}}",
         "size": 1
       },
       {
         "containerID": 1000,
-        "hostID": 1000,
+        "hostID": "{{host_gid}}",
         "size": 1
       },
       {
         "containerID": 100000,
-        "hostID": 100001,
-        "size": 65535
+        "hostID": "{{subgid_start_plus_1}}",
+        "size": "{{subgid_size_minus_1}}"
       }
     ],
     "maskedPaths": [
       "/projects/{{project}}/.secrets",
-      "/proc/acpi",
-      "/proc/asound",
-      "/proc/kcore",
-      "/proc/keys",
-      "/proc/latency_stats",
-      "/proc/timer_list",
-      "/proc/timer_stats",
-      "/proc/sched_debug",
-      "/sys/firmware",
-      "/proc/scsi"
-    ],
-    "readonlyPaths": [
-      "/proc/bus",
-      "/proc/fs",
-      "/proc/irq",
-      "/proc/sys",
-      "/proc/sysrq-trigger"
+      "/sys/firmware"
     ]
   }
 }
-

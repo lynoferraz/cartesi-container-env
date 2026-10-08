@@ -1,20 +1,21 @@
 # syntax=docker.io/docker/dockerfile:1
-ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260410"
+ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260922"
 ARG APT_UPDATE_SNAPSHOT=20260410T030400Z
-ARG CARTESI_MACHINE_EMULATOR_VERSION="0.20.0"
-ARG CARTESI_IMAGE_KERNEL_VERSION="0.20.0"
-ARG CARTESI_LINUX_KERNEL_VERSION="6.5.13-ctsi-1-v0.20.0"
-ARG CARTESI_ROLLUPS_NODE_VERSION="2.0.0-alpha.12"
-ARG CARTESI_CLI_VERSION="2.0.0-alpha.35"
+ARG CARTESI_MACHINE_EMULATOR_VERSION="0.21.0"
+ARG CARTESI_IMAGE_KERNEL_VERSION="0.21.0"
+ARG CARTESI_LINUX_KERNEL_VERSION="6.5.13-ctsi-2-v0.21.0"
+ARG CARTESI_ROLLUPS_NODE_VERSION="2.0.0-alpha.13"
+ARG CARTESI_CLI_VERSION="2.0.0-alpha.37"
 ARG FOUNDRY_VERSION="1.5.1"
 ARG SQUASHFS_TOOLS_VERSION="bad1d213ab6df587d6fa0ef7286180fbf7b86167" # 4.7.4
 ARG XGENEXT2_VERSION="1.5.6"
 ARG NVM_VERSION="977563e97ddc66facf3a8e31c6cff01d236f09bd" # 0.40.3
-ARG NODE_VERSION="24.14.0"
+ARG NODE_VERSION="24.21.0"
 ARG ALTO_VERSION="1.2.7"
 ARG ALTO_PACKAGE_VERSION="0.0.20"
-ARG CARTESAPP_VERSION="1.4.0"
-ARG PODMAN_VERSION=5.8.2-1
+ARG CARTESAPP_VERSION="1.4.1"
+ARG PODMAN_VERSION=6.1.2
+ARG PODMAN_COMPOSE_VERSION=1.6.0
 
 ################################################################################
 # base image
@@ -92,7 +93,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN <<EOF
 apt-get install -y --no-install-recommends \
     libslirp0 \
-    lua5.4
+    lua5.4 \
+    lua-lpeg
 rm -rf /var/lib/apt/lists/*
 EOF
 
@@ -101,8 +103,8 @@ RUN <<EOF
 curl -fsSL https://github.com/cartesi/machine-emulator/releases/download/v${CARTESI_MACHINE_EMULATOR_VERSION}/machine-emulator_${TARGETARCH}.deb \
     -o /tmp/machine-emulator.deb
 case "${TARGETARCH}" in
-    amd64) echo "46b2f37b889091df3b89a8909467935f8dd4a1426eeb0491b6a346a12f0c341c  /tmp/machine-emulator.deb" | sha256sum --check ;;
-    arm64) echo "27ea10571335ad174b75388e7de54a3d3434bd607554d8c0bdf6abca47ceae0d  /tmp/machine-emulator.deb" | sha256sum --check ;;
+    amd64) echo "5f13034f43454c340062c677146daabe77c587cee1bd60342c95b8ad8f1463a3  /tmp/machine-emulator.deb" | sha256sum --check ;;
+    arm64) echo "866f0bde2db53b9b8e6a6eac85e5ad4116338379fa25cdfcc5e4bf835f948bb1  /tmp/machine-emulator.deb" | sha256sum --check ;;
     *) echo "unsupported architecture: ${TARGETARCH}"; exit 1 ;;
 esac
 apt-get install -y --no-install-recommends /tmp/machine-emulator.deb
@@ -161,7 +163,7 @@ ARG TARGETOS
 
 USER root
 
-# Install cartesi-machine emulator
+# Install cartesi cli
 RUN <<EOF
 case "${TARGETARCH}" in
     amd64) 
@@ -186,8 +188,8 @@ FROM scratch AS kernel-image
 ARG CARTESI_IMAGE_KERNEL_VERSION
 ARG CARTESI_LINUX_KERNEL_VERSION
 
-ADD --checksum=sha256:65dd100ff6204346ac2f50f772721358b5c1451450ceb39a154542ee27b4c947 \
-    https://github.com/cartesi/image-kernel/releases/download/v${CARTESI_IMAGE_KERNEL_VERSION}/linux-${CARTESI_LINUX_KERNEL_VERSION}.bin \
+ADD --checksum=sha256:5c900060da2db2bfa84cd39cd9cd722988c83c42225f3cac55f2d3157e48f32f \
+    https://github.com/cartesi/machine-linux-image/releases/download/v${CARTESI_IMAGE_KERNEL_VERSION}/linux-${CARTESI_LINUX_KERNEL_VERSION}.bin \
     /usr/share/cartesi-machine/images/linux.bin
 
 ################################################################################
@@ -196,8 +198,8 @@ FROM base AS kernel-headers
 ARG CARTESI_IMAGE_KERNEL_VERSION
 ARG CARTESI_LINUX_KERNEL_VERSION
 
-ADD --checksum=sha256:4a4714bfa8c0028cb443db2036fad4f8da07065c1cb4ac8e0921a259fddd731b \
-    https://github.com/cartesi/image-kernel/releases/download/v${CARTESI_IMAGE_KERNEL_VERSION}/linux-headers-${CARTESI_LINUX_KERNEL_VERSION}.tar.xz \
+ADD --checksum=sha256:e3f140a8632fcfb18218e7aea32a7d002124d3dce5ba8121ae061ab7f40a6cf4 \
+    https://github.com/cartesi/machine-linux-image/releases/download/v${CARTESI_IMAGE_KERNEL_VERSION}/linux-headers-${CARTESI_LINUX_KERNEL_VERSION}.tar.xz \
     /tmp/linux-headers-${CARTESI_LINUX_KERNEL_VERSION}.tar.xz
 RUN tar -xJf "/tmp/linux-headers-${CARTESI_LINUX_KERNEL_VERSION}.tar.xz" -C /
 
@@ -282,8 +284,7 @@ curl -fsSL https://download.opensuse.org/repositories/home:alvistack/xUbuntu_${V
     | gpg --dearmor | tee /etc/apt/trusted.gpg.d/home_alvistack.gpg > /dev/null
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 apt-get install -y --no-install-recommends \
-    podman\
-    podman-compose \
+    podman \
     passt
 apt-get remove --purge -y \
     gnupg
@@ -291,61 +292,28 @@ rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/home:alvistack.list /etc/apt
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 EOF
 
-COPY --chmod=755 <<EOF /usr/bin/docker
-#!/bin/sh
-set -eu
-
-filtered=""
-last_arg=""
-arg_orig=""
-for arg in "\$@"; do
-    arg_orig="\$arg"
-    if [ "\$last_arg" = "--progress" ] && [ "\$arg" = "quiet" ]; then
-        filtered="\$filtered --quiet"
-    fi
-    if [ "\$1" =  "compose" ]; then
-        if [ "\$last_arg" = "-f" ] && [ "\$arg" = "-" ]; then
-            tmpfile=\$(mktemp)
-            cat > "\$tmpfile"
-            trap "rm -f \$tmpfile" EXIT
-            arg=\$tmpfile
-        fi
-        if [ "\$arg" = "--project-directory" ] || [ "\$last_arg" = "--project-directory" ] || [ "\$arg" = "--format" ] || [ "\$last_arg" = "--format" ]; then
-           arg=""
-        fi
-        filtered="\$filtered \$arg"
-    else
-        [ "\$arg" = "--progress" ] || [ "\$last_arg" = "--progress" ] || filtered="\$filtered \$arg"
-    fi
-    last_arg="\$arg_orig"
-done
-
-# shellcheck disable=SC2086
-exec podman \$filtered
-EOF
+# docker -> podman shim and healthcheck runner (see rootfs/ in the repo)
+COPY --chmod=755 rootfs/usr/bin/docker /usr/bin/docker
+COPY --chmod=755 rootfs/usr/local/bin/podman-healthcheck-runner /usr/local/bin/podman-healthcheck-runner
+COPY --chmod=755 rootfs/usr/local/bin/docker-shim-compose-fixup /usr/local/bin/docker-shim-compose-fixup
+# System-wide podman config (kept out of /home so it cannot drift)
+COPY --chmod=644 rootfs/etc/containers/containers.conf /etc/containers/containers.conf
+COPY --chmod=644 rootfs/etc/containers/registries.conf /etc/containers/registries.conf
 
 RUN <<EOF
 set -e
 echo 'ubuntu:100000:65535' > /etc/subuid
 echo 'ubuntu:100000:65535' > /etc/subgid
+# mountpoint for the per-session tmpfs (XDG_RUNTIME_DIR) declared in sandbox-config.template.json
+mkdir -p /run/user/1000
+chown 1000:1000 /run/user/1000
+chmod 700 /run/user/1000
 EOF
 
 ################################################################################
 # user install packages
 FROM install AS user-install
 USER ubuntu
-
-RUN mkdir -p /home/ubuntu/.config/containers
-COPY <<EOF /home/ubuntu/.config/containers/containers.conf
-[containers]
-default_sysctls = []
-netns = "host"
-pidns = "host"
-EOF
-
-COPY <<EOF /home/ubuntu/.config/containers/registries.conf
-unqualified-search-registries = ["docker.io"]
-EOF
 
 # Install nvm and node
 ENV NVM_DIR=/home/ubuntu/.nvm
@@ -365,10 +333,12 @@ RUN npm install -g /tmp/pimlico-alto.tgz
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ARG PODMAN_COMPOSE_VERSION
 
 RUN <<EOF
 # Ensure the venv is used for subsequent RUN and at runtime
 pip3 install --no-cache cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v${CARTESAPP_VERSION}
+pip3 install --no-cache podman-compose==${PODMAN_COMPOSE_VERSION}
 EOF
 
 RUN echo <<EOF
@@ -376,6 +346,7 @@ export NVM_DIR="\$([ -z "\${XDG_CONFIG_HOME-}" ] && printf %s "\${HOME}/.nvm" ||
 [ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh" # This loads nvm
 
 export PODMAN_COMPOSE_WARNING_LOGS=false
+export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/1000}"
 
 export PATH=/home/ubuntu/.local/bin:/opt/venv/bin:\$PATH
 EOF >> /home/ubuntu/.bashrc

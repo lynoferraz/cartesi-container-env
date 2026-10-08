@@ -10,7 +10,7 @@ RELEASE_TAG_DEFAULT="${CARTESI_SANDBOX_RELEASE_TAG:-latest}"
 INSTALL_DIR="${CARTESI_SANDBOX_HOME:-$HOME/.local/share/cartesi-sandbox}"
 BUNDLE_DIR="$INSTALL_DIR/bundle"
 ROOTFS_DIR="$BUNDLE_DIR/rootfs"
-TEMPLATE_CONFIG="$INSTALL_DIR/sandbox-config.json"
+TEMPLATE_CONFIG="$INSTALL_DIR/sandbox-config.template.json"
 
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
@@ -36,6 +36,30 @@ require_linux() {
     [ "$(uname -s)" = "Linux" ] || die "cartesi-sandbox requires Linux."
 }
 
+
+# Host-side identity used for the user namespace mapping and rootfs ownership.
+# Inside the sandbox the user is always uid/gid 1000 (ubuntu); on the host it is
+# whoever runs cartesi-sandbox, and the subordinate ranges come from /etc/subuid|subgid.
+host_ids() {
+    HOST_UID=$(id -u)
+    HOST_GID=$(id -g)
+    local me entry
+    me="${USER:-$(id -un)}"
+    entry=$(grep -E "^(${me}|${HOST_UID}):" /etc/subuid 2>/dev/null | head -n1 || true)
+    SUBUID_START=$(echo "$entry" | cut -d: -f2)
+    SUBUID_SIZE=$(echo "$entry" | cut -d: -f3)
+    entry=$(grep -E "^(${me}|${HOST_GID}):" /etc/subgid 2>/dev/null | head -n1 || true)
+    SUBGID_START=$(echo "$entry" | cut -d: -f2)
+    SUBGID_SIZE=$(echo "$entry" | cut -d: -f3)
+    [ -n "$SUBUID_START" ] && [ -n "$SUBUID_SIZE" ] && [ -n "$SUBGID_START" ] && [ -n "$SUBGID_SIZE" ] \
+        || die "No subuid/subgid entry for $me. Fix:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $me"
+    # Podman inside the sandbox needs 65535 ids above container id 100000 (its own
+    # /etc/subuid), i.e. a host range of at least 65536.
+    if [ "$SUBUID_SIZE" -lt 65536 ] || [ "$SUBGID_SIZE" -lt 65536 ]; then
+        warn "subuid/subgid range for $me is $SUBUID_SIZE/$SUBGID_SIZE ids; podman inside the sandbox needs 65536."
+        echo "    Fix:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $me" >&2
+    fi
+}
 
 resolve_release_tag() {
     local tag="$1"
@@ -79,6 +103,14 @@ cmd_doctor() {
     else
         err "Missing subuid/subgid entries for $me."
         echo "    Fix:  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $me"
+        hard_fail=1
+    fi
+
+    if [ -c /dev/net/tun ] && [ -r /dev/net/tun ] && [ -w /dev/net/tun ]; then
+        ok "/dev/net/tun available (rootless podman networking)"
+    else
+        err "/dev/net/tun missing or not writable by $me (needed by podman/pasta inside the sandbox)."
+        echo "    Fix:  sudo modprobe tun && sudo chmod 666 /dev/net/tun"
         hard_fail=1
     fi
 
@@ -177,8 +209,9 @@ install_from_source() {
     tmpdir=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" RETURN
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/Dockerfile" \
-        -o "$tmpdir/Dockerfile"
+    # The Dockerfile copies files from the repo (rootfs/), so fetch the whole tree.
+    curl -fsSL "https://github.com/${REPO}/archive/${BRANCH}.tar.gz" \
+        | tar -xz -C "$tmpdir" --strip-components=1
     ( cd "$tmpdir" \
         && docker buildx build -f Dockerfile --output "type=tar,dest=rootfs.tar" . )
     log "Extracting rootfs into $ROOTFS_DIR (requires sudo)..."
@@ -202,21 +235,25 @@ extract_rootfs_zst() {
 }
 
 apply_rootfs_permissions() {
+    host_ids
     log "Applying rootfs ownership and capabilities (sudo)..."
+    log "  root in sandbox -> host uid $SUBUID_START, ubuntu in sandbox -> host uid $HOST_UID"
     sudo cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
-    sudo chown -R 100000:100000 "$ROOTFS_DIR/"
-    sudo chown -R 1000:1000     "$ROOTFS_DIR/home/ubuntu/"
-    sudo chown -R 1000:1000     "$ROOTFS_DIR/opt/venv"
+    sudo chown -R "$SUBUID_START:$SUBGID_START" "$ROOTFS_DIR/"
+    sudo chown -R "$HOST_UID:$HOST_GID"         "$ROOTFS_DIR/home/ubuntu/"
+    sudo chown -R "$HOST_UID:$HOST_GID"         "$ROOTFS_DIR/opt/venv"
     sudo chmod 777 "$ROOTFS_DIR/tmp"
     sudo chmod 777 "$ROOTFS_DIR/var/tmp/"
+    sudo mkdir -p "$ROOTFS_DIR/run/user/1000"
+    sudo chown "$HOST_UID:$HOST_GID" "$ROOTFS_DIR/run/user/1000"
     sudo setcap cap_setuid+ep "$ROOTFS_DIR/usr/bin/newuidmap"
     sudo setcap cap_setgid+ep "$ROOTFS_DIR/usr/bin/newgidmap"
     sudo chmod -s "$ROOTFS_DIR/usr/bin/newuidmap" "$ROOTFS_DIR/usr/bin/newgidmap"
 }
 
 install_template_config() {
-    log "Fetching sandbox-config.json template..."
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/sandbox-config.json" \
+    log "Fetching sandbox-config.template.json..."
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/sandbox-config.template.json" \
         -o "$TEMPLATE_CONFIG"
 }
 
@@ -227,11 +264,22 @@ cmd_init() {
     project_dir=$(cd "$project_dir" && pwd)
     [ -f "$TEMPLATE_CONFIG" ] \
         || die "Template config not found at $TEMPLATE_CONFIG. Run: cartesi-sandbox install"
+    host_ids
     local out="$project_dir/sandbox-config.json"
     cp "$TEMPLATE_CONFIG" "$out"
     sed -i "s#{{project_path}}#${project_dir}#g" "$out"
     sed -i "s#{{project}}#$(basename "$project_dir")#g" "$out"
-    ok "Wrote $out"
+    # Host-side ids are numbers in the OCI spec: replace the quoted placeholders.
+    sed -i -e "s#\"{{host_uid}}\"#${HOST_UID}#g" \
+           -e "s#\"{{host_gid}}\"#${HOST_GID}#g" \
+           -e "s#\"{{subuid_start}}\"#${SUBUID_START}#g" \
+           -e "s#\"{{subgid_start}}\"#${SUBGID_START}#g" \
+           -e "s#\"{{subuid_start_plus_1}}\"#$((SUBUID_START + 1))#g" \
+           -e "s#\"{{subgid_start_plus_1}}\"#$((SUBGID_START + 1))#g" \
+           -e "s#\"{{subuid_size_minus_1}}\"#$((SUBUID_SIZE - 1))#g" \
+           -e "s#\"{{subgid_size_minus_1}}\"#$((SUBGID_SIZE - 1))#g" \
+           "$out"
+    ok "Wrote $out (host uid $HOST_UID, subordinate ids from $SUBUID_START)"
 }
 
 # Returns 0 (true) if a container/session with the given name is already running.
