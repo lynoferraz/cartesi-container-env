@@ -1,5 +1,5 @@
 # syntax=docker.io/docker/dockerfile:1
-ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260922"
+ARG BASE_IMAGE="docker.io/library/ubuntu:noble-20260917"
 ARG APT_UPDATE_SNAPSHOT=20260410T030400Z
 ARG CARTESI_MACHINE_EMULATOR_VERSION="0.21.0"
 ARG CARTESI_IMAGE_KERNEL_VERSION="0.21.0"
