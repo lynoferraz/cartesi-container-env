@@ -4,13 +4,16 @@
 #   curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/install.sh | sh
 #
 # Pass extra args after `--` :
-#   curl -fsSL .../install.sh | sh -s -- --from-source
-#   curl -fsSL .../install.sh | sh -s -- --tag v0.1.0
+#   curl -fsSL .../install.sh | sh -s -- --from-source   # build the rootfs locally from the
+#                                                        # Dockerfile only (needs docker buildx)
+#   curl -fsSL .../install.sh | sh -s -- --tag v0.1.0    # install this release (or, with
+#                                                        # --from-source, build this ref)
 #
 # Or skip the rootfs download and just place the script:
 #   curl -fsSL .../install.sh | sh -s -- --no-install
 #
-# Specify the script version to install (defaults to latest tag, or specified tag):
+# Specify the branch/tag the cartesi-sandbox script, Dockerfile and config template are
+# fetched from (defaults to main; the script version is then the latest tag):
 #   curl -fsSL .../install.sh | sh -s -- --branch v0.1.0
 set -eu
 
@@ -21,20 +24,20 @@ BIN_DIR="${CARTESI_SANDBOX_BIN_DIR:-$HOME/.local/bin}"
 [ "$(uname -s)" = "Linux" ] || { echo "cartesi-sandbox requires Linux." >&2; exit 1; }
 [ "$(id -u)" != "0" ]       || { echo "Do not run installer as root." >&2; exit 1; }
 
+# --no-install and --branch are handled here; everything else (--from-source, --tag ...)
+# is passed through to `cartesi-sandbox install`.
 skip_install=0
-for arg in "$@"; do
-    [ "$arg" = "--no-install" ] && skip_install=1
-done
-
-for arg in "$@"; do
-    if [ "$arg" = "--branch" ]; then
-        if [ -n "${2:-}" ]; then
-            BRANCH="$2"
-        else
-            echo "Error: --branch requires an argument." >&2
-            exit 1
-        fi
-    fi
+passthrough=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-install) skip_install=1 ;;
+        --branch)
+            [ -n "${2:-}" ] || { echo "Error: --branch requires an argument." >&2; exit 1; }
+            BRANCH="$2"; shift ;;
+        --branch=*) BRANCH="${1#--branch=}" ;;
+        *) passthrough="$passthrough $1" ;;
+    esac
+    shift
 done
 SCRIPT_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/cartesi-sandbox"
 
@@ -67,12 +70,8 @@ if [ "$skip_install" -eq 1 ]; then
 fi
 
 echo "Running first-time install (sudo will be requested for rootfs ownership)..."
-# Filter out --no-install so it doesn't reach the subcommand.
-filtered=""
-last_arg=""
-for arg in "$@"; do
-    [ "$arg" = "--no-install" ] || [ "$arg" = "--branch" ] || [ "$last_arg" = "--branch" ] || filtered="$filtered $arg"
-    last_arg="$arg"
-done
+# The installed script fetches the Dockerfile (--from-source) and the config template
+# from this branch/tag too.
+export CARTESI_SANDBOX_BRANCH="$BRANCH"
 # shellcheck disable=SC2086
-exec "$BIN_DIR/cartesi-sandbox" install $filtered
+exec "$BIN_DIR/cartesi-sandbox" install $passthrough

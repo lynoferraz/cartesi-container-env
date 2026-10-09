@@ -149,6 +149,10 @@ cmd_install() {
             -h|--help)
                 cat <<EOF
 Usage: cartesi-sandbox install [--from-source] [--tag <tag>]
+
+  --from-source   build the rootfs locally from the Dockerfile only (needs docker buildx)
+  --tag <tag>     release to download, or with --from-source the git ref whose
+                  Dockerfile is built (default: latest release / \$CARTESI_SANDBOX_BRANCH)
 EOF
                 return 0 ;;
             *) die "Unknown option: $1" ;;
@@ -168,7 +172,10 @@ EOF
     arch=$(detect_arch)
 
     if [ "$from_source" -eq 1 ]; then
-        install_from_source
+        # Build the Dockerfile of the requested tag, or of $BRANCH when no --tag was given.
+        local ref="$BRANCH"
+        [ "$tag" = "latest" ] || ref="$tag"
+        install_from_source "$ref"
     else
         install_from_release "$arch" "$tag"
     fi
@@ -203,17 +210,19 @@ install_from_release() {
 }
 
 install_from_source() {
+    local ref="$1"
     command -v docker >/dev/null 2>&1 || die "--from-source requires docker."
-    log "Building rootfs from source via docker buildx (this may take several minutes)..."
+    docker buildx version >/dev/null 2>&1 || die "--from-source requires docker buildx."
+    log "Building rootfs from the Dockerfile at ${REPO}@${ref} via docker buildx (this may take several minutes)..."
     local tmpdir
     tmpdir=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" RETURN
-    # The Dockerfile copies files from the repo (rootfs/), so fetch the whole tree.
-    curl -fsSL "https://github.com/${REPO}/archive/${BRANCH}.tar.gz" \
-        | tar -xz -C "$tmpdir" --strip-components=1
-    ( cd "$tmpdir" \
-        && docker buildx build -f Dockerfile --output "type=tar,dest=rootfs.tar" . )
+    # The Dockerfile is self-contained (every file it installs is inlined as a heredoc and
+    # everything else is fetched by the build), so the build context is just the Dockerfile.
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${ref}/Dockerfile" -o "$tmpdir/Dockerfile" \
+        || die "Could not download Dockerfile for ref '$ref'."
+    docker buildx build -f "$tmpdir/Dockerfile" --output "type=tar,dest=$tmpdir/rootfs.tar" "$tmpdir"
     log "Extracting rootfs into $ROOTFS_DIR (requires sudo)..."
     sudo rm -rf "$ROOTFS_DIR"
     sudo mkdir -p "$ROOTFS_DIR"
@@ -383,7 +392,8 @@ cartesi-sandbox $SCRIPT_VERSION — OCI sandbox for Cartesi development
 
 Usage:
   cartesi-sandbox install [--from-source] [--tag <tag>]
-                                       set up the rootfs (one-time)
+                                       set up the rootfs (one-time); --from-source builds
+                                       the Dockerfile locally instead of downloading a release
   cartesi-sandbox init    [path]       stage sandbox-config.json in a project
   cartesi-sandbox run     [path] [-c <config>] [-s <session>]
                                        run the sandbox for a project

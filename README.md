@@ -13,20 +13,23 @@ curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/ma
 This drops `cartesi-sandbox` into `~/.local/bin/`, downloads a CI-built rootfs tarball for
 your architecture from GitHub Releases, verifies it against `SHA256SUMS`, and installs it
 under `~/.local/share/cartesi-sandbox/`. The installer aborts early if host prerequisites
-are missing — it prints the exact `apt-get` / `usermod` commands to fix them. Use `--no-install` to skip the rootfs instalation, and `--branch` to specify the script branch or tag.
+are missing — it prints the exact `apt-get` / `usermod` commands to fix them. Use `--no-install` to skip the rootfs installation, and `--branch` to specify the branch or tag the script, Dockerfile and config template are fetched from.
 
-To build the rootfs locally instead (slow, needs docker):
+To build the rootfs locally instead (slow, needs docker with buildx). The Dockerfile is
+self-contained, so only it is downloaded — no clone of this repo is needed:
 
 ```shell
 curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/install.sh \
     | sh -s -- --from-source
 ```
 
-TO use a specific release of the rootfs:
+(`--from-source --tag v0.4.0` builds the Dockerfile of that tag instead of `main`.)
+
+To use a specific release of the rootfs:
 
 ```shell
 curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/install.sh \
-    | sh -s -- --tag v0.1.0
+    | sh -s -- --tag v0.4.0
 ```
 ## Usage
 
@@ -90,7 +93,8 @@ rootless sandbox:
   and publish ports.
 - `/run/user/1000` is a per-session tmpfs and `XDG_RUNTIME_DIR` points at it, so podman's
   runtime state (pause process pid, sockets, locks) never leaks from one session into the next.
-- `docker` is a shim over `podman` / `podman-compose` (`rootfs/usr/bin/docker`). It keeps
+- `docker` is a shim over `podman` / `podman-compose` (defined inline in the `Dockerfile`,
+  installed at `/usr/bin/docker`). It keeps
   argument quoting intact, answers the version probes of the cartesi CLI, remembers compose
   files passed on stdin per project (stored as `.docker-shim.<project>.compose.yml` plus a
   `.docker-shim.<project>.configs/` directory in the project directory until `compose down`;
@@ -101,12 +105,14 @@ rootless sandbox:
 
 ## Manual install (without the installer)
 
-If you don't want to pipe a script from the internet, the manual flow still works.
+If you don't want to pipe a script from the internet, the manual flow still works. Building
+the rootfs needs only the `Dockerfile` (every file it installs is inlined in it and everything
+else is fetched during the build), so there is nothing to clone. Use an empty directory as the
+build context so nothing else is sent to the builder:
 
 ```shell
-mkdir ~/sandbox && cd ~/sandbox
-git clone https://github.com/lynoferraz/cartesi-container-env.git
-cd cartesi-container-env
+mkdir -p ~/sandbox/build && cd ~/sandbox/build
+curl -fsSLO https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/Dockerfile
 
 docker buildx build -f Dockerfile --output type=tar,dest=../docker-sandbox.tar .
 cd ..
@@ -132,7 +138,8 @@ does the same substitutions):
 
 ```shell
 cd path/to/project
-cp ~/sandbox/cartesi-container-env/sandbox-config.template.json sandbox-config.json
+curl -fsSL https://raw.githubusercontent.com/lynoferraz/cartesi-container-env/main/sandbox-config.template.json \
+    -o sandbox-config.json
 sed -i "s#{{project_path}}#$(pwd)#g" sandbox-config.json
 sed -i "s#{{project}}#$(basename $(pwd))#g" sandbox-config.json
 sed -i -e "s#\"{{host_uid}}\"#$(id -u)#g" -e "s#\"{{host_gid}}\"#$(id -g)#g" \
@@ -199,8 +206,18 @@ runtime directories recorded in its database (`/tmp/containers-user-1000`,
 per-session `XDG_RUNTIME_DIR` (this deletes local images and containers, which are re-pulled
 on demand).
 
-To patch a rootfs in place instead of re-installing it (paths relative to
-`~/.local/share/cartesi-sandbox/bundle/rootfs`): copy `rootfs/usr/bin/docker`,
-`rootfs/usr/local/bin/podman-healthcheck-runner`, `rootfs/usr/local/bin/docker-shim-compose-fixup`
-and `rootfs/etc/containers/*` from this repo over the same paths (as root), and delete any
-`netns`, `pidns` or `helper_binaries_dir` lines from `home/ubuntu/.config/containers/containers.conf`.
+To patch a rootfs in place instead of re-installing it, extract just the shim files from a
+freshly built rootfs tar (see "Manual install" above for building `docker-sandbox.tar`) and
+give them back to the sandbox's root (the start of your subuid range):
+
+```shell
+ROOTFS=~/.local/share/cartesi-sandbox/bundle/rootfs
+sudo tar -xf docker-sandbox.tar -C "$ROOTFS" \
+    usr/bin/docker usr/local/bin/podman-healthcheck-runner usr/local/bin/docker-shim-compose-fixup etc/containers
+SUBUID=$(grep "^$USER:" /etc/subuid | cut -d: -f2)
+sudo chown -R "$SUBUID:$SUBUID" "$ROOTFS/usr/bin/docker" "$ROOTFS/usr/local/bin" "$ROOTFS/etc/containers"
+```
+
+Then delete any `netns`, `pidns` or `helper_binaries_dir` lines from
+`$ROOTFS/home/ubuntu/.config/containers/containers.conf`. (`cartesi-sandbox update` does a full
+re-install instead.)

@@ -292,13 +292,418 @@ rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/home:alvistack.list /etc/apt
 apt-get update --snapshot=${APT_UPDATE_SNAPSHOT}
 EOF
 
-# docker -> podman shim and healthcheck runner (see rootfs/ in the repo)
-COPY --chmod=755 rootfs/usr/bin/docker /usr/bin/docker
-COPY --chmod=755 rootfs/usr/local/bin/podman-healthcheck-runner /usr/local/bin/podman-healthcheck-runner
-COPY --chmod=755 rootfs/usr/local/bin/docker-shim-compose-fixup /usr/local/bin/docker-shim-compose-fixup
+# docker -> podman shim: forwards to podman / podman-compose and papers over the
+# differences the cartesi CLI depends on (see the header comment inside).
+COPY --chmod=755 <<'EOF' /usr/bin/docker
+#!/bin/bash
+# docker -> podman compatibility shim for the cartesi-sandbox rootfs.
+#
+# The cartesi CLI (and other tools) call `docker ...`. This shim forwards to
+# podman / podman-compose while preserving argument quoting exactly, and papers
+# over the differences the cartesi CLI depends on:
+#   * `docker version --format '{{json .Client.Version}}'` and
+#     `docker compose version --short` answer with versions that pass the CLI's
+#     semver minimums (Docker >= 25.0.0, Compose >= 2.24.0).
+#   * `--progress <mode>` is dropped for builds (`quiet` becomes `--quiet`).
+#   * compose: a file given as `-f -` (stdin) is stored in the project directory
+#     so relative paths in it resolve, and it is remembered per project name so
+#     later `compose --project-name X ps|exec|port|down` calls work without -f.
+#   * compose: `ps <service> --format json` is answered from `podman inspect`
+#     in docker-compose's JSON shape ({"Service","State","Health"}).
+#   * compose: top-level `configs` (ignored by podman-compose) are rewritten into
+#     bind-mounted files by docker-shim-compose-fixup; `port` output gets the
+#     0.0.0.0: prefix docker prints; `config --format` is dropped.
+#   * compose up: starts podman-healthcheck-runner (no systemd in the sandbox).
+# Set DOCKER_SHIM_DEBUG=1 to log the exact podman argv to stderr.
+set -euo pipefail
+
+debug() { [ -n "${DOCKER_SHIM_DEBUG:-}" ] && printf 'docker-shim: %s\n' "$*" >&2; return 0; }
+run_podman() { debug "podman $(printf '%q ' "$@")"; exec podman "$@"; }
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp/docker-shim-$(id -u)}"
+index_dir="$runtime_dir/docker-shim/projects"
+
+sub="${1:-}"
+
+# ---------------------------------------------------------------- version
+if [ "$sub" = "version" ]; then
+    if [ "${2:-}" = "--format" ] && [[ "${3:-}" == *Client.Version* ]]; then
+        pv=$(podman version --format '{{.Client.Version}}' 2>/dev/null || echo unknown)
+        printf '"25.0.0-podman%s"\n' "$pv"
+        exit 0
+    fi
+    run_podman "$@"
+fi
+
+# ---------------------------------------------------------------- buildx ls
+# cartesi doctor: `docker buildx ls --format '{{.Platforms}}'` must list linux/riscv64.
+# podman has no `buildx ls`; report the native platform plus riscv64 when the
+# qemu user-mode emulator is installed (binfmt registration lives on the host).
+if [ "$sub" = "buildx" ] && [ "${2:-}" = "ls" ]; then
+    case "$(uname -m)" in
+        x86_64)  native="linux/amd64" ;;
+        aarch64) native="linux/arm64" ;;
+        *)       native="linux/$(uname -m)" ;;
+    esac
+    platforms="$native"
+    if [ -x /usr/bin/qemu-riscv64-static ] || [ -e /proc/sys/fs/binfmt_misc/qemu-riscv64 ]; then
+        platforms="$platforms,linux/riscv64"
+    fi
+    echo "$platforms"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- build
+if [ "$sub" != "compose" ]; then
+    args=()
+    i=1
+    while [ $i -le $# ]; do
+        arg="${!i}"
+        next_i=$((i + 1))
+        next="${!next_i:-}"
+        case "$arg" in
+            --progress)
+                [ "$next" = "quiet" ] && args+=("--quiet")
+                i=$((i + 2)); continue ;;
+            --progress=*)
+                [ "${arg#--progress=}" = "quiet" ] && args+=("--quiet")
+                i=$((i + 1)); continue ;;
+        esac
+        args+=("$arg")
+        i=$((i + 1))
+    done
+    run_podman "${args[@]}"
+fi
+
+# ---------------------------------------------------------------- compose
+shift   # drop "compose"
+
+global=()
+files=()
+project=""
+projdir=""
+cmd=""
+cmdargs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f|--file)               files+=("${2:?}"); shift 2 ;;
+        --file=*)                files+=("${1#--file=}"); shift ;;
+        -p|--project-name)       project="${2:?}"; shift 2 ;;
+        --project-name=*)        project="${1#--project-name=}"; shift ;;
+        --project-directory)     projdir="${2:?}"; shift 2 ;;
+        --project-directory=*)   projdir="${1#--project-directory=}"; shift ;;
+        --env-file|--profile)    global+=("$1" "${2:?}"); shift 2 ;;
+        --env-file=*|--profile=*) global+=("$1"); shift ;;
+        --ansi|--progress)       shift 2 ;;      # not supported by podman-compose
+        --ansi=*|--progress=*|--compatibility) shift ;;
+        -*)                      global+=("$1"); shift ;;
+        *)                       cmd="$1"; shift; cmdargs=("$@"); break ;;
+    esac
+done
+
+if [ "$cmd" = "version" ]; then
+    cv=$(podman-compose version --short 2>/dev/null | tail -n1 || true)
+    echo "2.24.0-podman-compose${cv:-unknown}"
+    exit 0
+fi
+
+normalize_project() {   # docker-compose project name rules
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '_' | sed -e 's/^[^a-z0-9]*//'
+}
+
+# A compose file on stdin: store it in the project directory (relative paths in
+# it resolve against the file's directory) and remember it for this project.
+resolved=()
+for f in "${files[@]}"; do
+    if [ "$f" != "-" ]; then resolved+=("$f"); continue; fi
+    tmp=$(mktemp)
+    cat > "$tmp"
+    name="$project"
+    if [ -z "$name" ]; then
+        name=$(sed -n -E 's/^name:[[:space:]]*["'"'"']?([^"'"'"'[:space:]#]+).*/\1/p' "$tmp" | head -n1)
+    fi
+    dir="${projdir:-$PWD}"
+    dir=$(cd "$dir" && pwd)
+    [ -n "$name" ] || name=$(basename "$dir")
+    name=$(normalize_project "$name")
+    [ -n "$project" ] || project="$name"
+    dest="$dir/.docker-shim.$name.compose.yml"
+    mv "$tmp" "$dest"
+    chmod 600 "$dest"
+    mkdir -p "$index_dir"
+    printf '%s\n' "$dest" > "$index_dir/$name"
+    debug "stored stdin compose file for project '$name' at $dest"
+    # podman-compose ignores compose `configs`; turn them into bind-mounted files.
+    if command -v docker-shim-compose-fixup >/dev/null 2>&1; then
+        docker-shim-compose-fixup "$dest" "$name" || debug "compose fixup failed for $dest"
+    fi
+    resolved+=("$dest")
+done
+files=("${resolved[@]}")
+
+# No -f given: reuse the file remembered for this project name, if any.
+if [ ${#files[@]} -eq 0 ] && [ -n "$project" ]; then
+    key=$(normalize_project "$project")
+    if [ -f "$index_dir/$key" ]; then
+        cached=$(cat "$index_dir/$key")
+        if [ -f "$cached" ]; then
+            files+=("$cached")
+            debug "using remembered compose file $cached"
+        fi
+    fi
+fi
+
+pc=()
+for f in "${files[@]}"; do pc+=("-f" "$f"); done
+[ -n "$project" ] && pc+=("--project-name" "$project")
+pc+=("${global[@]}")
+
+case "$cmd" in
+    ps)
+        # `compose ps <service> --format json` -> one JSON object for that service.
+        services=()
+        rest=()
+        want_json=0
+        j=0
+        while [ $j -lt ${#cmdargs[@]} ]; do
+            a="${cmdargs[$j]}"
+            case "$a" in
+                --format)       [ "${cmdargs[$((j+1))]:-}" = "json" ] && want_json=1; rest+=("$a" "${cmdargs[$((j+1))]:-}"); j=$((j+2)); continue ;;
+                --format=json)  want_json=1; rest+=("$a"); j=$((j+1)); continue ;;
+                -*)             rest+=("$a") ;;
+                *)              services+=("$a") ;;
+            esac
+            j=$((j+1))
+        done
+        if [ ${#services[@]} -eq 1 ]; then
+            svc="${services[0]}"
+            name="${project:-$(normalize_project "$(basename "$PWD")")}"
+            ctr="${name}_${svc}_1"
+            if podman container exists "$ctr" 2>/dev/null; then
+                podman inspect --format \
+                    '{"Service":"'"$svc"'","Name":"{{.Name}}","State":"{{.State.Status}}","Health":"{{if .State.Health}}{{.State.Health.Status}}{{end}}","ExitCode":{{.State.ExitCode}}}' \
+                    "$ctr"
+            fi
+            exit 0
+        fi
+        run_podman compose "${pc[@]}" ps "${rest[@]}"
+        ;;
+    up)
+        podman-healthcheck-runner start >/dev/null 2>&1 || true
+        run_podman compose "${pc[@]}" up "${cmdargs[@]}"
+        ;;
+    down)
+        debug "podman compose $(printf '%q ' "${pc[@]}") down $(printf '%q ' "${cmdargs[@]}")"
+        podman compose "${pc[@]}" down "${cmdargs[@]}"
+        rc=$?
+        if [ $rc -eq 0 ] && [ -n "$project" ]; then
+            key=$(normalize_project "$project")
+            if [ -f "$index_dir/$key" ]; then
+                cached=$(cat "$index_dir/$key")
+                case "$(basename "$cached")" in
+                    .docker-shim.*.compose.yml)
+                        rm -f "$cached"
+                        rm -rf "$(dirname "$cached")/.docker-shim.$key.configs" ;;
+                esac
+                rm -f "$index_dir/$key"
+            fi
+        fi
+        exit $rc
+        ;;
+    port)
+        # docker prints "0.0.0.0:PORT"; podman-compose prints only "PORT" and the
+        # cartesi CLI builds URLs from it.
+        out=$(podman compose "${pc[@]}" port "${cmdargs[@]}") || exit $?
+        case "$out" in
+            ''|*:*) printf '%s\n' "$out" ;;
+            *)      printf '0.0.0.0:%s\n' "$out" ;;
+        esac
+        ;;
+    config)
+        # podman-compose config has no --format; it always prints yaml.
+        rest=()
+        skip=0
+        for a in "${cmdargs[@]}"; do
+            if [ $skip = 1 ]; then skip=0; continue; fi
+            case "$a" in --format) skip=1; continue ;; --format=*) continue ;; esac
+            rest+=("$a")
+        done
+        run_podman compose "${pc[@]}" config "${rest[@]}"
+        ;;
+    "")
+        run_podman compose "${pc[@]}"
+        ;;
+    *)
+        run_podman compose "${pc[@]}" "$cmd" "${cmdargs[@]}"
+        ;;
+esac
+EOF
+
+# Runs container healthchecks on a timer (no systemd inside the sandbox).
+COPY --chmod=755 <<'EOF' /usr/local/bin/podman-healthcheck-runner
+#!/bin/bash
+# podman-healthcheck-runner: run container healthchecks on a timer.
+#
+# Rootless podman schedules healthchecks through systemd transient timers.
+# There is no systemd inside the sandbox, so Health.Status would stay
+# "starting" forever and `depends_on: condition: service_healthy` (used by
+# `cartesi run`) would never resolve. This daemon polls running containers
+# that define a healthcheck and runs `podman healthcheck run` for them.
+#
+# Usage: podman-healthcheck-runner start   # idempotent, daemonizes
+#        podman-healthcheck-runner run     # foreground loop
+#        podman-healthcheck-runner stop
+set -u
+
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp/docker-shim-$(id -u)}"
+state_dir="$runtime_dir/docker-shim"
+pidfile="$state_dir/healthcheck-runner.pid"
+interval="${PODMAN_HEALTHCHECK_INTERVAL:-2}"
+idle_limit="${PODMAN_HEALTHCHECK_IDLE_EXIT:-600}"   # seconds without running containers before exiting
+
+alive() {
+    local pid
+    pid=$(cat "$pidfile" 2>/dev/null) || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+        && grep -q podman-healthcheck-runner "/proc/$pid/cmdline" 2>/dev/null
+}
+
+run_loop() {
+    mkdir -p "$state_dir"
+    echo $$ > "$pidfile"
+    trap 'rm -f "$pidfile"; exit 0' TERM INT
+    local idle=0 ids id has_hc
+    while :; do
+        ids=$(podman ps --filter status=running --format '{{.ID}}' 2>/dev/null) || ids=""
+        if [ -z "$ids" ]; then
+            idle=$((idle + interval))
+            # keep going while a compose up is still in progress (image pulls can take minutes)
+            if [ "$idle" -ge "$idle_limit" ] && ! pgrep -f "podman-compose .* up" >/dev/null 2>&1; then break; fi
+            sleep "$interval"
+            continue
+        fi
+        idle=0
+        for id in $ids; do
+            has_hc=$(podman inspect --format '{{if .Config.Healthcheck}}{{if .Config.Healthcheck.Test}}{{index .Config.Healthcheck.Test 0}}{{end}}{{end}}' "$id" 2>/dev/null) || has_hc=""
+            case "$has_hc" in
+                ""|NONE) continue ;;
+            esac
+            podman healthcheck run "$id" >/dev/null 2>&1 || true
+        done
+        sleep "$interval"
+    done
+    rm -f "$pidfile"
+}
+
+case "${1:-start}" in
+    start)
+        mkdir -p "$state_dir"
+        alive && exit 0
+        setsid nohup "$0" run >/dev/null 2>&1 < /dev/null &
+        # give the daemon a moment to write its pidfile so `start` is reliably idempotent
+        for _ in 1 2 3 4 5 6 7 8 9 10; do alive && exit 0; sleep 0.1; done
+        exit 0
+        ;;
+    run)
+        alive && [ "$(cat "$pidfile")" != "$$" ] && exit 0
+        run_loop
+        ;;
+    stop)
+        if alive; then kill "$(cat "$pidfile")"; fi
+        rm -f "$pidfile"
+        ;;
+    status)
+        if alive; then echo "running (pid $(cat "$pidfile"))"; else echo "not running"; exit 1; fi
+        ;;
+    *)
+        echo "usage: $0 {start|run|stop|status}" >&2; exit 2 ;;
+esac
+EOF
+
+# Rewrites compose `configs` into bind mounts (podman-compose ignores them).
+COPY --chmod=755 <<'EOF' /usr/local/bin/docker-shim-compose-fixup
+#!/opt/venv/bin/python3
+"""Rewrite a compose file so podman-compose 1.6.0 can run it.
+
+podman-compose ignores top-level `configs:` and per-service `configs:` (it has
+no equivalent of docker's config objects). This turns every config into a
+plain file next to the compose file and replaces the service-level entries by
+read-only bind mounts, which podman-compose does support.
+
+Usage: docker-shim-compose-fixup <compose.yml> <project>
+Writes the file in place; config contents go to
+<dir>/.docker-shim.<project>.configs/<name>.
+"""
+import os
+import stat
+import sys
+
+import yaml
+
+path, project = sys.argv[1], sys.argv[2]
+base = os.path.dirname(os.path.abspath(path))
+with open(path) as fh:
+    doc = yaml.safe_load(fh) or {}
+
+configs = doc.pop("configs", None) or {}
+if not configs:
+    sys.exit(0)
+
+cfg_dir = os.path.join(base, f".docker-shim.{project}.configs")
+os.makedirs(cfg_dir, mode=0o700, exist_ok=True)
+
+files = {}
+for name, spec in configs.items():
+    spec = spec or {}
+    if "content" in spec:
+        dest = os.path.join(cfg_dir, name)
+        with open(dest, "w") as fh:
+            fh.write(spec["content"])
+        os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        files[name] = dest
+    elif "file" in spec:
+        files[name] = os.path.abspath(os.path.join(base, os.path.expanduser(spec["file"])))
+    elif "environment" in spec:
+        dest = os.path.join(cfg_dir, name)
+        with open(dest, "w") as fh:
+            fh.write(os.environ.get(spec["environment"], ""))
+        files[name] = dest
+    else:
+        sys.stderr.write(f"docker-shim: config '{name}' has no content/file/environment, skipping\n")
+
+for svc_name, svc in (doc.get("services") or {}).items():
+    entries = (svc or {}).pop("configs", None) or []
+    volumes = svc.setdefault("volumes", [])
+    for entry in entries:
+        if isinstance(entry, str):
+            source, target = entry, f"/{entry}"
+        else:
+            source = entry.get("source")
+            target = entry.get("target") or f"/{source}"
+        if source not in files:
+            sys.stderr.write(f"docker-shim: service '{svc_name}' references unknown config '{source}'\n")
+            continue
+        volumes.append(f"{files[source]}:{target}:ro")
+    if not volumes:
+        svc.pop("volumes", None)
+
+with open(path, "w") as fh:
+    yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
+EOF
+
 # System-wide podman config (kept out of /home so it cannot drift)
-COPY --chmod=644 rootfs/etc/containers/containers.conf /etc/containers/containers.conf
-COPY --chmod=644 rootfs/etc/containers/registries.conf /etc/containers/registries.conf
+COPY --chmod=644 <<'EOF' /etc/containers/containers.conf
+# System-wide podman configuration for the cartesi-sandbox rootfs.
+# Containers get their own pid and network namespaces (pasta); the sandbox's
+# OCI config provides /dev/net/tun and an unmasked /proc so that works.
+[containers]
+
+[engine]
+EOF
+
+COPY --chmod=644 <<'EOF' /etc/containers/registries.conf
+unqualified-search-registries = ["docker.io"]
+EOF
 
 RUN <<EOF
 set -e
@@ -341,15 +746,15 @@ pip3 install --no-cache cartesapp[dev]@git+https://github.com/prototyp3-dev/cart
 pip3 install --no-cache podman-compose==${PODMAN_COMPOSE_VERSION}
 EOF
 
-RUN echo <<EOF
-export NVM_DIR="\$([ -z "\${XDG_CONFIG_HOME-}" ] && printf %s "\${HOME}/.nvm" || printf %s "\${XDG_CONFIG_HOME}/nvm")"
-[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh" # This loads nvm
+RUN cat <<'EOF' >> /home/ubuntu/.bashrc
+export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm
 
 export PODMAN_COMPOSE_WARNING_LOGS=false
-export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/1000}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
 
-export PATH=/home/ubuntu/.local/bin:/opt/venv/bin:\$PATH
-EOF >> /home/ubuntu/.bashrc
+export PATH=/home/ubuntu/.local/bin:/opt/venv/bin:$PATH
+EOF
 
 USER root
 
