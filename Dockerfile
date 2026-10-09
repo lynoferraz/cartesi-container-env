@@ -5,7 +5,7 @@ ARG CARTESI_MACHINE_EMULATOR_VERSION="0.21.0"
 ARG CARTESI_IMAGE_KERNEL_VERSION="0.21.0"
 ARG CARTESI_LINUX_KERNEL_VERSION="6.5.13-ctsi-2-v0.21.0"
 ARG CARTESI_ROLLUPS_NODE_VERSION="2.0.0-alpha.13"
-ARG CARTESI_CLI_VERSION="2.0.0-alpha.37"
+ARG CARTESI_CLI_VERSION="2.0.0-alpha.38"
 ARG FOUNDRY_VERSION="1.5.1"
 ARG SQUASHFS_TOOLS_VERSION="bad1d213ab6df587d6fa0ef7286180fbf7b86167" # 4.7.4
 ARG XGENEXT2_VERSION="1.5.6"
@@ -14,7 +14,6 @@ ARG NODE_VERSION="24.21.0"
 ARG ALTO_VERSION="1.2.7"
 ARG ALTO_PACKAGE_VERSION="0.0.20"
 ARG CARTESAPP_VERSION="1.4.1"
-ARG PODMAN_VERSION=6.1.2
 ARG PODMAN_COMPOSE_VERSION=1.6.0
 
 ################################################################################
@@ -216,7 +215,6 @@ ARG TARGETARCH
 ARG TARGETOS
 ARG XGENEXT2_VERSION
 ARG CARTESAPP_VERSION
-ARG PODMAN_VERSION
 
 USER root
 ARG DEBIAN_FRONTEND=noninteractive
@@ -304,7 +302,11 @@ COPY --chmod=755 <<'EOF' /usr/bin/docker
 #   * `docker version --format '{{json .Client.Version}}'` and
 #     `docker compose version --short` answer with versions that pass the CLI's
 #     semver minimums (Docker >= 25.0.0, Compose >= 2.24.0).
-#   * `--progress <mode>` is dropped for builds (`quiet` becomes `--quiet`).
+#   * build: `--progress <mode>` is dropped (`quiet` becomes `--quiet`); the
+#     buildx-only `--output type=docker` and `--load` are dropped (podman always
+#     commits the image to its store; `--output type=tar,dest=..` passes through);
+#     `--metadata-file <f>` is emulated with `--iidfile` so the file gets the
+#     `containerimage.config.digest` that `cartesi build` reads afterwards.
 #   * compose: a file given as `-f -` (stdin) is stored in the project directory
 #     so relative paths in it resolve, and it is remembered per project name so
 #     later `compose --project-name X ps|exec|port|down` calls work without -f.
@@ -354,8 +356,24 @@ if [ "$sub" = "buildx" ] && [ "${2:-}" = "ls" ]; then
 fi
 
 # ---------------------------------------------------------------- build
+# `docker build` / `docker buildx build` -> `podman build`. buildah only knows
+# `--output type=local|tar`, and `--metadata-file` only exists in buildah >= 1.44
+# (podman >= 6.0); the cartesi CLI passes both, so they are translated here for
+# every podman version (one code path):
+#   --output type=docker  dropped (the image is committed to the store anyway)
+#   --load                dropped (buildx only)
+#   --metadata-file <f>   replaced by --iidfile; after a successful build <f> gets
+#                         {"containerimage.config.digest":"sha256:<id>",
+#                          "containerimage.digest":"<manifest digest>"}
+#                         which the CLI reads before `docker image inspect`.
 if [ "$sub" != "compose" ]; then
+    is_build=0
+    if [ "$sub" = "build" ]; then is_build=1; fi
+    if [ "$sub" = "buildx" ] && [ "${2:-}" = "build" ]; then is_build=1; fi
+    if [ "$is_build" = 0 ]; then run_podman "$@"; fi
+
     args=()
+    metadata_file=""
     i=1
     while [ $i -le $# ]; do
         arg="${!i}"
@@ -368,11 +386,47 @@ if [ "$sub" != "compose" ]; then
             --progress=*)
                 [ "${arg#--progress=}" = "quiet" ] && args+=("--quiet")
                 i=$((i + 1)); continue ;;
+            --output|-o)
+                case "$next" in
+                    type=docker|type=docker,*) i=$((i + 2)); continue ;;
+                esac ;;
+            --output=type=docker|--output=type=docker,*|-o=type=docker|-o=type=docker,*)
+                i=$((i + 1)); continue ;;
+            --load)
+                i=$((i + 1)); continue ;;
+            --metadata-file)
+                metadata_file="${next:?--metadata-file needs a path}"
+                i=$((i + 2)); continue ;;
+            --metadata-file=*)
+                metadata_file="${arg#--metadata-file=}"
+                i=$((i + 1)); continue ;;
         esac
         args+=("$arg")
         i=$((i + 1))
     done
-    run_podman "${args[@]}"
+    if [ -z "$metadata_file" ]; then run_podman "${args[@]}"; fi
+
+    # Emulate --metadata-file: run podman as a child (stdin stays inherited for
+    # `--file -`), then turn the --iidfile result into the JSON the CLI expects.
+    mkdir -p "$runtime_dir/docker-shim"
+    iidfile=$(mktemp "$runtime_dir/docker-shim/iid.XXXXXX")
+    args+=("--iidfile" "$iidfile")
+    debug "podman $(printf '%q ' "${args[@]}")"
+    rc=0
+    podman "${args[@]}" || rc=$?
+    image_id=$(cat "$iidfile" 2>/dev/null || true)
+    rm -f "$iidfile"
+    if [ $rc -ne 0 ]; then exit $rc; fi
+    if [ -z "$image_id" ]; then
+        echo "docker-shim: podman build succeeded but wrote no image id" >&2
+        exit 1
+    fi
+    digest=$(podman image inspect --format '{{.Digest}}' "$image_id" 2>/dev/null || true)
+    case "$digest" in sha256:*) ;; *) digest="$image_id" ;; esac
+    printf '{"containerimage.config.digest":"%s","containerimage.digest":"%s"}\n' \
+        "$image_id" "$digest" > "$metadata_file"
+    debug "wrote metadata file $metadata_file for image $image_id"
+    exit 0
 fi
 
 # ---------------------------------------------------------------- compose

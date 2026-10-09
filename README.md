@@ -101,7 +101,10 @@ rootless sandbox:
   add both to your `.gitignore`), rewrites compose `configs` into bind mounts (podman-compose
   ignores them, which would leave the `cartesi run` proxy without routes), and starts
   `podman-healthcheck-runner`, which runs container healthchecks because there is no systemd
-  to schedule them. Set `DOCKER_SHIM_DEBUG=1` to see the podman commands it runs.
+  to schedule them. For `build` it drops the buildx-only `--output type=docker` (buildah only
+  knows `type=local|tar`, and the image is committed to the store anyway) and emulates
+  `--metadata-file` through `--iidfile`, writing the `containerimage.config.digest` that
+  `cartesi build` reads afterwards. Set `DOCKER_SHIM_DEBUG=1` to see the podman commands it runs.
 
 ## Manual install (without the installer)
 
